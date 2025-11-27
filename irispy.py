@@ -248,7 +248,7 @@ def on_message(chat: ChatContext):
             case "!노래가사":
                 get_lyrics(chat)
 
-            case "!텍스트" | "!사진" | "!껄무새" | "!멈춰" | "!지워" | "!진행" | "!말대꾸" | "!텍스트추가":
+            case "!텍스트" | "!사진" | "!껄무새" | "!멈춰" | "!지워" | "!진행" | "!말대꾸" | "!텍스트추가"| "!업로드":
                 draw_text(chat)
 
             case "!코인" | "!내코인" | "!바낸" | "!김프" | "!달러" | "!코인등록" | "!코인삭제":
@@ -266,7 +266,7 @@ def on_message(chat: ChatContext):
             case "/포기":
                 giveup_nonsense_quiz(chat)
 
-            case "!파티" | "!참가" | "!파티현황" | "!파티취소" | "!파티삭제":
+            case "/파티" | "/참가" | "/파티현황" | "/파티취소" | "/파티삭제"|"/레이드파티":
                 handle_party_command(chat)
     except Exception as e:
         print(e)
