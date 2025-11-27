@@ -16,6 +16,7 @@ from iris.kakaolink import IrisLink
 from bots.detect_nickname_change import detect_nickname_change
 import sys, threading, random
 from bots.party import handle_party_command
+from bots.game_369 import handle_369_command, handle_369_turn  # ✅ 추가
 iris_url = sys.argv[1]
 bot = Bot(iris_url)
 
@@ -209,7 +210,16 @@ def giveup_nonsense_quiz(chat: ChatContext):
 @is_not_banned
 def on_message(chat: ChatContext):
     try:
-        match chat.message.command:
+        cmd = chat.message.command
+
+        # ✅ 1) 369 명령어 먼저 처리
+        if handle_369_command(chat):
+            # 명령어 처리 후에도 일반 턴 체크 (바로 다음 사람이 이어서 칠 수 있게)
+            handle_369_turn(chat)
+            return
+
+        # ✅ 2) 나머지 기존 명령어 처리
+        match cmd:
 
             case "!hhi":
                 chat.reply(f"Hello {chat.sender.name}")
@@ -217,7 +227,6 @@ def on_message(chat: ChatContext):
             case "!tt" | "!ttt" | "!프사" | "!프사링":
                 reply_photo(chat, kl)
 
-            # make your own help.png or remove !iris
             case "!iris":
                 chat.reply_media("res/help.png")
 
@@ -248,15 +257,12 @@ def on_message(chat: ChatContext):
             case "!노래가사":
                 get_lyrics(chat)
 
-            case "!텍스트" | "!사진" | "!껄무새" | "!멈춰" | "!지워" | "!진행" | "!말대꾸" | "!텍스트추가"| "!업로드":
+            case "!텍스트" | "!사진" | "!껄무새" | "!멈춰" | "!지워" | "!진행" | "!말대꾸" | "!텍스트추가" | "!업로드":
                 draw_text(chat)
 
             case "!코인" | "!내코인" | "!바낸" | "!김프" | "!달러" | "!코인등록" | "!코인삭제":
                 get_coin_info(chat)
 
-            # ─────────────────────────────
-            # 넌센스 챗봇 명령
-            # ─────────────────────────────
             case "/넌센스":
                 start_nonsense_quiz(chat)
 
@@ -266,11 +272,18 @@ def on_message(chat: ChatContext):
             case "/포기":
                 giveup_nonsense_quiz(chat)
 
-            case "/파티" | "/참가" | "/파티현황" | "/파티취소" | "/파티삭제"|"/레이드파티":
+            case "/파티" | "/참가" | "/파티현황" | "/파티취소" | "/파티삭제" | "/레이드파티":
                 handle_party_command(chat)
+
+            case _:
+                # 369 이외의 일반 텍스트는 여기로 떨어짐
+                pass
+
+        # ✅ 3) 일반 메시지에 대해서 369 턴 처리
+        handle_369_turn(chat)
+
     except Exception as e:
         print(e)
-
 
 # 입장감지
 @bot.on_event("new_member")
