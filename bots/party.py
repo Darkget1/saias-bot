@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import threading
-import re
-from datetime import datetime, timedelta
+from datetime import datetime, date
 from typing import Dict, Any, Optional
 
 from iris import ChatContext
@@ -18,6 +17,10 @@ PARTY_LOCK = threading.RLock()
 # 파티 ID 시퀀스 (전역 증가 숫자)
 _PARTY_ID_SEQ = 1
 
+# 마지막으로 파티 상태를 사용한 "날짜"
+# - 날짜가 바뀌면(자정 지나면) PARTY_STATE 를 전부 초기화한다.
+_PARTY_STATE_DATE: Optional[date] = None
+
 
 def _next_party_id() -> int:
     """새 파티 ID 발급 (전역 증가 숫자)."""
@@ -28,7 +31,7 @@ def _next_party_id() -> int:
 
 
 def _truncate(text: str, max_len: int) -> str:
-    """카톡 한 줄 18자 정도 맞추기 위해 길면 잘라서 … 붙이기."""
+    """카톡 말풍선 폭을 고려해 너무 길면 잘라준다."""
     text = str(text or "")
     if len(text) <= max_len:
         return text
@@ -40,24 +43,21 @@ def _get_room_id(chat: ChatContext) -> int:
     return chat.room.id
 
 
-# PARTY_STATE 구조 예시:
-# {
-#   room_id: {
-#       owner_id: {
-#           "party_id": int,      # 파티 고유 ID
-#           "title": str,
-#           "time_str": str,      # "21:30" 또는 "30분 뒤 (21:30)" 같이 표시용
-#           "start_at": datetime, # 알림 예정 시간
-#           "max_members": 4 또는 8,
-#           "members": [ { "id": int, "name": str }, ... ],
-#           "timer": threading.Timer,
-#           "owner_id": int,
-#           "owner_name": str,
-#           "is_raid": bool,      # 레이드 파티 여부
-#       },
-#       ...
-#   },
-# }
+def _ensure_today_state():
+    """
+    날짜가 바뀌었으면(자정 이후) 모든 파티 상태를 초기화한다.
+    - 서버 시간 기준으로 동작.
+    """
+    global PARTY_STATE, _PARTY_STATE_DATE
+    today = datetime.now().date()
+
+    if _PARTY_STATE_DATE is None:
+        _PARTY_STATE_DATE = today
+        return
+
+    if _PARTY_STATE_DATE != today:
+        PARTY_STATE.clear()
+        _PARTY_STATE_DATE = today
 
 
 # ─────────────────────────────
@@ -69,9 +69,11 @@ def _get_user_name(sender) -> str:
     sender.name 이 None 이거나 없는 경우를 대비해서
     nickname, nick, id 등으로 안전하게 이름을 만들어준다.
     """
-    name = getattr(sender, "name", None) \
-        or getattr(sender, "nickname", None) \
-        or getattr(sender, "nick", None)
+    name = (
+            getattr(sender, "name", None)
+            or getattr(sender, "nickname", None)
+            or getattr(sender, "nick", None)
+    )
 
     if not name:
         uid = getattr(sender, "id", "?")
@@ -79,83 +81,147 @@ def _get_user_name(sender) -> str:
     return str(name)
 
 
-def _parse_party_time(param: str) -> tuple[datetime, str, str]:
+def _parse_main_flag(token: str) -> Optional[bool]:
     """
-    param 예시:
-      - '21:30 발로란트'
-      - '30 발로란트'
-      - '21:30'
-    반환:
-      (start_at: datetime, time_label: str, title: str)
+    '본', '본캐', 'main', 'm' → True
+    '부', '부캐', 'sub', 'alt', 's' → False
+    그 외 → None
+    """
+    if not token:
+        return None
+    t = token.strip().lower()
+    if t in ("본", "본캐", "m", "main"):
+        return True
+    if t in ("부", "부캐", "s", "sub", "alt"):
+        return False
+    return None
+
+
+def _extract_cls_from_tokens(tokens: list[str]) -> Optional[str]:
+    """
+    /추가 명령 등에서 직업만 필요할 때 사용.
+    본/부 토큰은 무시하고, 나머지 첫 토큰을 직업으로 본다.
+    """
+    for t in tokens:
+        if _parse_main_flag(t) is None:
+            return t
+    return None
+
+
+def _extract_cls_and_main(tokens: list[str]) -> tuple[Optional[str], Optional[bool]]:
+    """
+    토큰 리스트에서 직업과 본/부 플래그를 같이 추출한다.
+    """
+    cls: Optional[str] = None
+    main_flag: Optional[bool] = None
+
+    for t in tokens:
+        flag = _parse_main_flag(t)
+        if flag is not None:
+            main_flag = flag
+        elif cls is None:
+            cls = t
+
+    return cls, main_flag
+
+
+def _parse_party_create_args(param: str) -> tuple[str, Optional[str]]:
+    """
+    /파티, /레이드파티 에서 사용하는 인자 파싱.
     """
     param = (param or "").strip()
     if not param:
-        raise ValueError("시간과 제목을 함께 입력해주세요. 예) /파티 21:30 발로란트")
+        return "파티", None
 
-    parts = param.split(maxsplit=1)
-    time_part = parts[0]
-    title = parts[1] if len(parts) > 1 else "파티"
+    tokens = param.split()
+    if not tokens:
+        return "파티", None
 
-    now = datetime.now()
+    # 맨 뒤에서부터 본/부 토큰은 제거
+    while tokens and _parse_main_flag(tokens[-1]) is not None:
+        tokens.pop()
 
-    # 1) HH:MM 형태
-    if re.match(r"^\d{1,2}:\d{2}$", time_part):
-        hour, minute = map(int, time_part.split(":"))
-        start_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if start_at <= now:
-            start_at = start_at + timedelta(days=1)
-        time_label = start_at.strftime("%m/%d %H:%M")
-        return start_at, time_label, title
+    if not tokens:
+        return "파티", None
 
-    # 2) 숫자만 → N분 뒤
-    if time_part.isdigit():
-        minutes = int(time_part)
-        start_at = now + timedelta(minutes=minutes)
-        time_label = f"{minutes}분 뒤 ({start_at.strftime('%H:%M')})"
-        return start_at, time_label, title
+    if len(tokens) >= 2:
+        cls = tokens[-1]
+        title_tokens = tokens[:-1]
+    else:
+        cls = None
+        title_tokens = tokens
 
-    raise ValueError("시간 형식이 올바르지 않습니다. 예) /파티 21:30 제목  또는  /파티 30 제목")
+    title = " ".join(title_tokens) if title_tokens else "파티"
+    return title, cls
 
 
-def _notify_party(chat: ChatContext, room_id: int, owner_id: int):
-    """타이머가 호출하는 실제 알림 함수 (멘션 없이 안내만)."""
-    with PARTY_LOCK:
-        room_parties = PARTY_STATE.get(room_id)
-        if not room_parties:
-            return
+def _format_party_table(party: Dict[str, Any]) -> str:
+    """
+    파티 정보를 카톡에서 보기 좋게 출력하는 포맷(22자 기준).
 
-        party = room_parties.get(owner_id)
-        if not party:
-            return
+    [변경 사항]
+    출력 순서: No | 본/부 | 직업 | 이름
+    """
+    members = party.get("members", [])
+    max_members = party.get("max_members", len(members))
+    party_id = party.get("party_id", "?")
+    title = party.get("title") or "파티"
+    owner_name = party.get("owner_name") or "-"
 
-        # 멤버 이름 리스트
-        safe_names = []
-        for m in party["members"]:
-            n = m.get("name") or f"User{m.get('id', '?')}"
-            safe_names.append(str(n))
-        members_str = ", ".join(safe_names)
+    is_raid = party.get("is_raid")
+    kind = "레이드 파티" if is_raid else "일반 파티"
 
-        kind = "레이드 파티" if party.get("is_raid") else "파티"
-        outro = "즐거운 레이드 되세요!" if party.get("is_raid") else "즐거운 게임 되세요!"
+    lines: list[str] = []
 
-        msg = (
-            f"🎉 {kind} 시간입니다!\n"
-            f"제목: {party['title']}\n"
-            f"시간: {party['time_str']}\n"
-            f"인원: {len(party['members'])}/{party['max_members']}\n"
-            f"멤버: {members_str}\n\n"
-            f"{outro}"
-        )
+    # ── 헤더 (각 줄 22자 이내) ───────────────────
+    lines.append(_truncate(f"🎮 {kind} #{party_id}", 22))
+    lines.append(f"제목: {_truncate(title, 18)}")
+    lines.append(f"파티장: {_truncate(owner_name, 17)}")
+    lines.append(f"인원: {len(members)}/{max_members}")
+    lines.append("")  # 빈 줄
 
-        chat.reply(msg)
+    # ── 멤버 목록 ───────────────────────────────
+    lines.append("👥 멤버 목록")
 
-        # 알림 후 파티 삭제
-        room_parties.pop(owner_id, None)
-        if not room_parties:
-            PARTY_STATE.pop(room_id, None)
+    if not members:
+        lines.append("(아직 멤버 없음)")
+        return "\n".join(lines)
+
+    # 컬럼 헤더: No | 본/부 | 직업 | 이름
+    lines.append("No | 본/부 | 직업 | 이름")
+
+    for idx, m in enumerate(members, start=1):
+        raw_name = m.get("name") or f"User{m.get('id', '?')}"
+        raw_cls = m.get("cls") or "-"
+
+        # 공백 제거
+        clean_name = str(raw_name).replace(" ", "")
+        clean_cls = str(raw_cls).replace(" ", "")
+
+        # is_main 값 우선, 없으면 1번=본케, 나머지=부케
+        is_main_flag = m.get("is_main")
+        if is_main_flag is None:
+            is_main_flag = (idx == 1)
+
+        role_str = "본케" if is_main_flag else "부케"
+
+        # 포맷팅 (22자 제한 고려)
+        # 1) 번호+본/부(합쳐서 6~7자) | 직업(4자) | 이름(나머지)
+        # 예: 1)본케|전사  |홍길동
+
+        role_fixed = role_str[:2]  # "본케" (2글자)
+        cls_fixed = clean_cls[:4].ljust(0)  # 직업 4칸 확보
+
+        # 이름은 뒷부분에 배치하여 자연스럽게 잘리도록 함
+        line = f"{idx}) {role_fixed} | {cls_fixed} | {clean_name}"
+        lines.append(_truncate(line, 22))
+
+    return "\n".join(lines)
 
 
-def _find_party_by_owner_name(room_parties: Dict[int, Dict[str, Any]], name: str) -> Optional[int]:
+def _find_party_by_owner_name(
+        room_parties: Dict[int, Dict[str, Any]], name: str
+) -> Optional[int]:
     """파티장 닉네임(또는 @닉네임)으로 owner_id 찾기 (호환용)."""
     if not name:
         return None
@@ -171,14 +237,28 @@ def _find_party_by_owner_name(room_parties: Dict[int, Dict[str, Any]], name: str
     return None
 
 
+def _join_help_lines() -> list[str]:
+    """22자 기준으로 자른 참여 안내 문구."""
+    return [
+        "",
+        "====참여 방법====",
+        "/파티참여 ID 직업 본/부",
+        "예) /참여 3 도적 본 ",
+    ]
+
+
 # ─────────────────────────────
 # 외부에서 호출할 명령 함수들
 # ─────────────────────────────
 
 def create_party(chat: ChatContext):
     """ /파티 명령 처리: 기본 4인 파티."""
+    _ensure_today_state()
+
     room_id = _get_room_id(chat)
     param = getattr(chat.message, "param", "") or ""
+
+    title, cls = _parse_party_create_args(param)
 
     owner_id = chat.sender.id
     owner_name = _get_user_name(chat.sender)
@@ -188,72 +268,54 @@ def create_party(chat: ChatContext):
 
         if owner_id in room_parties:
             party = room_parties[owner_id]
-            safe_names = [
-                (m.get("name") or f"User{m.get('id', '?')}")
-                for m in party["members"]
-            ]
-            members_str = ", ".join(str(n) for n in safe_names)
-
-            chat.reply(
-                "이미 이 방에 당신이 만든 파티가 있어요.\n"
-                f"파티 ID: {party.get('party_id', '?')}\n"
-                f"제목: {party['title']}\n"
-                f"시간: {party['time_str']}\n"
-                f"인원: {len(party['members'])}/{party['max_members']}\n"
-                f"멤버: {members_str}\n"
-                "해당 ID로 `/참가 파티ID` 명령을 사용할 수 있습니다."
-            )
+            table = _format_party_table(party)
+            msg_lines = [
+                            "이미 만든 파티가 있어요.",
+                            "",
+                            table,
+                        ] + _join_help_lines()
+            chat.reply("\n".join(msg_lines))
             return
 
-        try:
-            start_at, time_label, title = _parse_party_time(param)
-        except ValueError as e:
-            chat.reply(str(e))
-            return
+        party_id = _next_party_id()
 
         creator = {
             "id": owner_id,
             "name": owner_name,
+            "cls": cls,
+            "is_main": True,  # 파티장 기본 본케
         }
-
-        delay = max((start_at - datetime.now()).total_seconds(), 1.0)
-        party_id = _next_party_id()
-
-        timer = threading.Timer(
-            delay,
-            _notify_party,
-            args=(chat, room_id, owner_id),
-        )
 
         room_parties[owner_id] = {
             "party_id": party_id,
             "title": title,
-            "time_str": time_label,
-            "start_at": start_at,
             "max_members": 4,
             "members": [creator],
-            "timer": timer,
             "owner_id": owner_id,
             "owner_name": owner_name,
             "is_raid": False,
         }
 
-        timer.start()
+        table = _format_party_table(room_parties[owner_id])
 
-        chat.reply(
-            "🎮 새 파티를 만들었어요!\n"
-            f"파티 ID: {party_id}\n"
-            f"제목: {title}\n"
-            f"시간: {time_label}\n"
-            "인원: 1/4\n"
-            "참가하려면 `/참가 파티ID` 형식으로 보내주세요. 예) `/참가 3`"
-        )
+        msg_lines = [
+                        "🎮 새 파티를 만들었어요!",
+                        "",
+                        table,
+                    ] + _join_help_lines()
+        chat.reply("\n".join(msg_lines))
 
 
 def create_raid_party(chat: ChatContext):
     """ /레이드파티 명령 처리: 8인 레이드 파티."""
+    _ensure_today_state()
+
     room_id = _get_room_id(chat)
     param = getattr(chat.message, "param", "") or ""
+
+    title, cls = _parse_party_create_args(param)
+    if title == "파티":
+        title = "레이드 파티"
 
     owner_id = chat.sender.id
     owner_name = _get_user_name(chat.sender)
@@ -263,77 +325,55 @@ def create_raid_party(chat: ChatContext):
 
         if owner_id in room_parties:
             party = room_parties[owner_id]
-            safe_names = [
-                (m.get("name") or f"User{m.get('id', '?')}")
-                for m in party["members"]
-            ]
-            members_str = ", ".join(str(n) for n in safe_names)
-
-            chat.reply(
-                "이미 이 방에 당신이 만든 파티가 있어요.\n"
-                f"파티 ID: {party.get('party_id', '?')}\n"
-                f"제목: {party['title']}\n"
-                f"시간: {party['time_str']}\n"
-                f"인원: {len(party['members'])}/{party['max_members']}\n"
-                f"멤버: {members_str}\n"
-                "해당 ID로 `/참가 파티ID` 명령을 사용할 수 있습니다."
-            )
+            table = _format_party_table(party)
+            msg_lines = [
+                            "이미 만든 파티가 있어요.",
+                            "",
+                            table,
+                        ] + _join_help_lines()
+            chat.reply("\n".join(msg_lines))
             return
 
-        try:
-            start_at, time_label, title = _parse_party_time(param)
-        except ValueError as e:
-            chat.reply(str(e))
-            return
+        party_id = _next_party_id()
 
         creator = {
             "id": owner_id,
             "name": owner_name,
+            "cls": cls,
+            "is_main": True,
         }
-
-        delay = max((start_at - datetime.now()).total_seconds(), 1.0)
-        party_id = _next_party_id()
-
-        timer = threading.Timer(
-            delay,
-            _notify_party,
-            args=(chat, room_id, owner_id),
-        )
 
         room_parties[owner_id] = {
             "party_id": party_id,
             "title": title,
-            "time_str": time_label,
-            "start_at": start_at,
-            "max_members": 8,   # 레이드: 8명
+            "max_members": 8,
             "members": [creator],
-            "timer": timer,
             "owner_id": owner_id,
             "owner_name": owner_name,
             "is_raid": True,
         }
 
-        timer.start()
+        table = _format_party_table(room_parties[owner_id])
 
-        chat.reply(
-            "⚔️ 레이드 파티를 만들었어요!\n"
-            f"파티 ID: {party_id}\n"
-            f"제목: {title}\n"
-            f"시간: {time_label}\n"
-            "인원: 1/8\n"
-            "참가하려면 `/참가 파티ID` 형식으로 보내주세요. 예) `/참가 3`"
-        )
+        msg_lines = [
+                        "⚔️ 레이드 파티를 만들었어요!",
+                        "",
+                        table,
+                    ] + _join_help_lines()
+        chat.reply("\n".join(msg_lines))
 
 
 def delete_party(chat: ChatContext):
-    """ /파티삭제 명령 처리 (내가 파티장인 파티들을 전부 삭제)."""
+    """ /파티삭제 명령 처리 (내가 파티장인 파티를 모두 삭제)."""
+    _ensure_today_state()
+
     room_id = _get_room_id(chat)
     user_id = chat.sender.id
 
     with PARTY_LOCK:
         room_parties = PARTY_STATE.get(room_id)
         if not room_parties:
-            chat.reply("현재 이 방에는 삭제할 파티가 없어요.")
+            chat.reply("삭제할 파티가 없어요.")
             return
 
         owner_parties = [
@@ -341,141 +381,322 @@ def delete_party(chat: ChatContext):
         ]
 
         if not owner_parties:
-            chat.reply("이 방에서 당신이 만든 파티가 없어요.")
+            chat.reply("당신이 만든 파티가 없어요.")
             return
 
-        for owner_id, party in owner_parties:
-            timer = party.get("timer")
-            if timer:
-                timer.cancel()
+        for owner_id, _party in owner_parties:
             room_parties.pop(owner_id, None)
 
         if not room_parties:
             PARTY_STATE.pop(room_id, None)
 
-        chat.reply("🛑 당신이 만든 파티를 모두 삭제했습니다.")
+        chat.reply("🛑 당신이 만든 파티를 삭제했어요.")
+
+
+def add_member_by_master(chat: ChatContext):
+    """
+    /추가 명령 처리 (파티장 전용)
+    형식: /추가 닉네임 [직업] [본/부]
+    """
+    _ensure_today_state()
+
+    room_id = _get_room_id(chat)
+    owner_id = chat.sender.id
+    param = (getattr(chat.message, "param", "") or "").strip()
+
+    with PARTY_LOCK:
+        room_parties = PARTY_STATE.get(room_id)
+        if not room_parties or owner_id not in room_parties:
+            chat.reply("먼저 `/파티 제목` 으로 파티를 만들어 주세요.")
+            return
+
+        party = room_parties[owner_id]
+
+        if not param:
+            chat.reply("사용법: `/추가 닉네임 [직업] [본/부]`")
+            return
+
+        tokens = param.split()
+        name = tokens[0]
+
+        # ───────────────────────────────────────────────────────────
+        # [수정] 기존 _extract_cls_from_tokens 대신
+        # _extract_cls_and_main을 사용하여 직업과 본/부 설정을 모두 파싱
+        # ───────────────────────────────────────────────────────────
+        cls = None
+        is_main = None
+
+        if len(tokens) >= 2:
+            cls, is_main = _extract_cls_and_main(tokens[1:])
+
+        if len(party["members"]) >= party["max_members"]:
+            chat.reply(
+                f"⚠️ 이미 인원이 가득 찼어요! "
+                f"({party['max_members']}/{party['max_members']})"
+            )
+            return
+
+        new_member = {
+            "id": 0,  # 임의 인원 (실제 유저 ID 아님)
+            "name": name,
+            "cls": cls,
+        }
+
+        # [수정] 파싱된 본/부 설정이 있다면 적용
+        if is_main is not None:
+            new_member["is_main"] = is_main
+
+        party["members"].append(new_member)
+
+        table = _format_party_table(party)
+        chat.reply(f"✅ `{name}` 님을 추가했어요.\n\n{table}")
+
+        if len(party["members"]) == party["max_members"]:
+            full_msg = (
+                    f"🎉 {'레이드 파티' if party.get('is_raid') else '파티'} "
+                    f"인원이 모두 모였습니다!\n"
+                    f"({party['max_members']}/{party['max_members']})\n\n"
+                    + table
+            )
+            chat.reply(full_msg)
+
+
+def kick_member(chat: ChatContext):
+    """
+    /파티추방 [번호]
+    - 파티장만 사용 가능.
+    - 1번(파티장)은 추방 불가.
+    """
+    _ensure_today_state()
+
+    room_id = _get_room_id(chat)
+    owner_id = chat.sender.id
+    param = (getattr(chat.message, "param", "") or "").strip()
+
+    with PARTY_LOCK:
+        room_parties = PARTY_STATE.get(room_id)
+        if not room_parties or owner_id not in room_parties:
+            chat.reply("추방할 파티가 없거나, 파티장이 아니에요.")
+            return
+
+        party = room_parties[owner_id]
+
+        if not param.isdigit():
+            chat.reply("사용법: `/파티추방 번호` (예: /파티추방 2)")
+            return
+
+        target_idx = int(param)
+
+        # 1번(파티장) 보호 로직
+        if target_idx == 1:
+            chat.reply("⚠️ 파티장은 추방할 수 없습니다. 파티를 없애려면 `/파티삭제`를 해주세요.")
+            return
+
+        # 인덱스 유효성 검사 (화면엔 1부터 표시되므로 실제 인덱스는 -1)
+        real_idx = target_idx - 1
+        if real_idx < 0 or real_idx >= len(party["members"]):
+            chat.reply(f"{target_idx}번 멤버가 존재하지 않습니다.")
+            return
+
+        # 멤버 삭제
+        removed = party["members"].pop(real_idx)
+
+        table = _format_party_table(party)
+        chat.reply(f"🚫 `{removed['name']}` 님을 파티에서 추방했어요.\n\n{table}")
 
 
 def join_party(chat: ChatContext):
-    """ /참가 명령 처리 (파티 ID 기준, 닉네임 방식은 호환용)."""
+    """ /참가, /참여 명령 처리 """
+    _ensure_today_state()
+
     room_id = _get_room_id(chat)
-    param = (getattr(chat.message, "param", "") or "").strip()
-    user = {
-        "id": chat.sender.id,
-        "name": _get_user_name(chat.sender),
-    }
+    raw_param = (getattr(chat.message, "param", "") or "").strip()
+    tokens = raw_param.split()
+
+    user_id = chat.sender.id
+    user_name = _get_user_name(chat.sender)
 
     with PARTY_LOCK:
         room_parties = PARTY_STATE.get(room_id)
         if not room_parties:
-            chat.reply(
-                "현재 이 방에는 모집 중인 파티가 없어요.\n"
-                "`/파티 21:30 제목` 또는 `/레이드파티 21:30 제목` 으로 새로 만들어주세요!"
-            )
+            chat.reply("모집 중인 파티가 없어요.")
             return
 
         target_owner_id: Optional[int] = None
-        party = None
+        party: Optional[Dict[str, Any]] = None
+        cls: Optional[str] = None
+        is_main: Optional[bool] = None
 
-        if param:
-            if param.isdigit():
-                target_party_id = int(param)
+        if tokens:
+            # 1-1) 첫 토큰이 숫자면 → 파티 ID
+            if tokens[0].isdigit():
+                target_party_id = int(tokens[0])
                 for oid, p in room_parties.items():
                     if p.get("party_id") == target_party_id:
                         target_owner_id = oid
                         party = p
                         break
                 if target_owner_id is None:
-                    chat.reply(
-                        "해당 파티 ID를 찾을 수 없어요.\n"
-                        "현재 파티 목록은 `/파티현황` 으로 확인하고,\n"
-                        "`/참가 파티ID` 형식으로 다시 시도해주세요."
-                    )
+                    msg_lines = [
+                                    "해당 ID의 파티가 없어요.",
+                                    "현재 파티 목록은 `/파티현황` 으로",
+                                    "확인해 주세요.",
+                                ] + _join_help_lines()
+                    chat.reply("\n".join(msg_lines))
                     return
+
+                cls, is_main = _extract_cls_and_main(tokens[1:])
+
             else:
-                target_owner_id = _find_party_by_owner_name(room_parties, param)
-                if target_owner_id is None:
-                    chat.reply(
-                        "해당 파티를 찾을 수 없어요.\n"
-                        "이제는 `/참가 파티ID` 형식으로 참가하는 것을 권장합니다.\n"
-                        "`/파티현황` 으로 파티 ID를 먼저 확인해주세요."
+                # 1-2) 첫 토큰이 숫자가 아닐 때
+                if len(room_parties) == 1:
+                    target_owner_id = next(iter(room_parties.keys()))
+                    party = room_parties[target_owner_id]
+                    cls, is_main = _extract_cls_and_main(tokens)
+                else:
+                    target_owner_id = _find_party_by_owner_name(
+                        room_parties, tokens[0]
                     )
-                    return
-                party = room_parties.get(target_owner_id)
+                    if target_owner_id is None:
+                        msg_lines = [
+                                        "파티가 여러 개 있어요.",
+                                        "ID로 참가하는 걸 권장해요.",
+                                    ] + _join_help_lines()
+                        chat.reply("\n".join(msg_lines))
+                        return
+                    party = room_parties.get(target_owner_id)
+                    cls, is_main = _extract_cls_and_main(tokens[1:])
         else:
+            # 1-3) 파라미터가 없을 때
             if len(room_parties) == 1:
                 target_owner_id = next(iter(room_parties.keys()))
                 party = room_parties[target_owner_id]
             else:
-                lines = ["현재 이 방에는 여러 파티가 있어요:"]
+                lines = ["여러 파티가 있어요:"]
                 for p_owner_id, p in room_parties.items():
                     kind = "레이드" if p.get("is_raid") else "일반"
                     lines.append(
-                        f"- ID: {p.get('party_id', '?')} / [{kind}] 파티장: {p['owner_name']} "
-                        f"/ 제목: {p['title']} / 시간: {p['time_str']} "
-                        f"/ 인원: {len(p['members'])}/{p['max_members']}"
+                        f"- ID:{p.get('party_id', '?')} "
+                        f"[{kind}] {p['owner_name']}"
                     )
-                lines.append("\n`/참가 파티ID` 로 참가할 파티를 골라주세요. 예) `/참가 3`")
+                lines += _join_help_lines()
                 chat.reply("\n".join(lines))
                 return
 
         if not party:
-            chat.reply("선택한 파티가 더 이상 존재하지 않아요.")
+            chat.reply("선택한 파티가 더 이상 없어요.")
             return
 
-        if any(m["id"] == user["id"] for m in party["members"]):
-            chat.reply("이미 이 파티에 참가 중이에요!")
+        # ──────────────────────
+        # 2) 이미 이 파티에 있는 경우 → 직업/본부 수정
+        # ──────────────────────
+        existing_index: Optional[int] = None
+        for i, m in enumerate(party["members"]):
+            if m["id"] == user_id:
+                existing_index = i
+                break
+
+        if existing_index is not None:
+            member = party["members"][existing_index]
+            old_cls = member.get("cls")
+            old_is_main = member.get("is_main")
+
+            if cls:
+                member["cls"] = cls
+
+            if is_main is not None:
+                member["is_main"] = is_main
+
+            is_main_flag = member.get("is_main")
+            if is_main_flag is None:
+                is_main_flag = (existing_index == 0)
+
+            my_role_label = "본케" if is_main_flag else "부케"
+            table = _format_party_table(party)
+
+            if cls and cls != old_cls:
+                header = f"✅ 직업을 {cls} 로 수정했어요."
+            elif is_main is not None and is_main != old_is_main:
+                header = f"✅ 포지션을 {my_role_label} 로 수정했어요."
+            elif cls or is_main is not None:
+                header = "이미 같은 정보예요.\n현재 상태를 다시 보여줄게요."
+            else:
+                header = "현재 내 정보를 다시 보여줄게요."
+
+            msg_lines = [
+                header,
+                "",
+                f"내 포지션: {my_role_label}",
+                "",
+                table,
+            ]
+            chat.reply("\n".join(msg_lines))
             return
 
+        # ──────────────────────
+        # 3) 새로 참가하는 경우
+        # ──────────────────────
         if len(party["members"]) >= party["max_members"]:
-            chat.reply(f"⚠️ 이미 인원이 가득 찼어요! ({party['max_members']}/{party['max_members']})")
+            chat.reply(
+                f"⚠️ 이미 인원이 가득 찼어요! "
+                f"({party['max_members']}/{party['max_members']})"
+            )
             return
 
-        party["members"].append(user)
+        member = {
+            "id": user_id,
+            "name": user_name,
+            "cls": cls,
+        }
 
-        safe_names = [
-            (m.get("name") or f"User{m.get('id', '?')}")
-            for m in party["members"]
+        if is_main is not None:
+            member["is_main"] = is_main
+
+        party["members"].append(member)
+
+        my_index = len(party["members"]) - 1
+        is_main_flag = member.get("is_main")
+        if is_main_flag is None:
+            is_main_flag = (my_index == 0)
+
+        my_role_label = "본케" if is_main_flag else "부케"
+        kind_str = "레이드 파티" if party.get("is_raid") else "파티"
+        table = _format_party_table(party)
+
+        msg_lines = [
+            f"✅ {kind_str}에 참가했어요.",
+            f"내 직업: {cls or '-'}",
+            f"내 포지션: {my_role_label}",
+            "",
+            table,
         ]
-        members_str = ", ".join(str(n) for n in safe_names)
-
-        kind = "레이드 파티" if party.get("is_raid") else "파티"
-
-        chat.reply(
-            f"✅ {kind}에 참가했습니다!\n"
-            f"파티 ID: {party.get('party_id', '?')}\n"
-            f"파티장: {party['owner_name']}\n"
-            f"제목: {party['title']}\n"
-            f"시간: {party['time_str']}\n"
-            f"현재 인원: {len(party['members'])}/{party['max_members']}\n"
-            f"멤버: {members_str}"
-        )
+        chat.reply("\n".join(msg_lines))
 
         if len(party["members"]) == party["max_members"]:
-            names = ", ".join(str(n) for n in safe_names)
             chat.reply(
-                f"🎉 {kind} 인원이 모두 모였습니다! "
-                f"({party['max_members']}/{party['max_members']})\n"
-                f"파티 ID: {party.get('party_id', '?')}\n"
-                f"파티장: {party['owner_name']}\n"
-                f"멤버: {names}\n"
-                f"시간: {party['time_str']} 에 알림을 보낼게요."
+                f"🎉 {kind_str} 인원이 모두 모였어요!\n"
+                f"({party['max_members']}/{party['max_members']})\n\n"
+                + table
             )
 
 
 def show_party_status(chat: ChatContext):
     """ /파티현황 명령 처리."""
+    _ensure_today_state()
+
     room_id = _get_room_id(chat)
 
     with PARTY_LOCK:
         room_parties = PARTY_STATE.get(room_id)
         if not room_parties:
-            chat.reply("현재 이 방에는 모집 중인 파티가 없어요.")
+            chat.reply("현재 모집 중인 파티가 없어요.")
             return
 
         lines: list[str] = ["📋 현재 파티 현황"]
 
-        for idx, (owner_id, party) in enumerate(room_parties.items(), start=1):
+        for idx, (_owner_id, party) in enumerate(
+                room_parties.items(), start=1
+        ):
             safe_names = []
             for m in party["members"]:
                 n = m.get("name") or f"User{m.get('id', '?')}"
@@ -486,31 +707,29 @@ def show_party_status(chat: ChatContext):
 
             lines.append("────────────────")
             lines.append(f"#{idx} [{kind}]")
-            lines.append(f"ID   : {party.get('party_id', '?')}")
-            lines.append(f"파티장: {_truncate(party['owner_name'], 12)}")
-            lines.append(f"제목  : {_truncate(party['title'], 14)}")
-            lines.append(f"시간  : {_truncate(party['time_str'], 14)}")
+            lines.append(f"ID:{party.get('party_id', '?')}")
+            lines.append(f"장:{_truncate(party['owner_name'], 10)}")
+            lines.append(f"제목:{_truncate(party['title'], 12)}")
             lines.append(
-                f"인원  : {len(party['members'])}/{party['max_members']}"
+                f"인원:{len(party['members'])}/{party['max_members']}"
             )
-            lines.append(f"멤버  : {_truncate(members_str, 16)}")
+            lines.append(f"멤버:{_truncate(members_str, 14)}")
 
-        lines.append(
-            "\n원하는 파티의 ID로 `/참가 파티ID` 를 입력해서 참가할 수 있어요. 예) `/참가 3`"
-        )
-
+        lines += _join_help_lines()
         chat.reply("\n".join(lines))
 
 
 def leave_party(chat: ChatContext):
     """ /파티취소 명령 처리 (본인이 속한 모든 파티에서 나가기)."""
+    _ensure_today_state()
+
     room_id = _get_room_id(chat)
     user_id = chat.sender.id
 
     with PARTY_LOCK:
         room_parties = PARTY_STATE.get(room_id)
         if not room_parties:
-            chat.reply("현재 이 방에는 모집 중인 파티가 없어요.")
+            chat.reply("모집 중인 파티가 없어요.")
             return
 
         joined: list[tuple[int, Dict[str, Any]]] = []
@@ -519,7 +738,7 @@ def leave_party(chat: ChatContext):
                 joined.append((owner_id, party))
 
         if not joined:
-            chat.reply("이 방의 어떤 파티에도 참가 중이 아니에요.")
+            chat.reply("참가 중인 파티가 없어요.")
             return
 
         cancelled_titles = []
@@ -527,17 +746,13 @@ def leave_party(chat: ChatContext):
 
         for owner_id, party in joined:
             if party["owner_id"] == user_id:
-                timer = party.get("timer")
-                if timer:
-                    timer.cancel()
                 room_parties.pop(owner_id, None)
                 cancelled_titles.append(party["title"])
             else:
-                party["members"] = [m for m in party["members"] if m["id"] != user_id]
+                party["members"] = [
+                    m for m in party["members"] if m["id"] != user_id
+                ]
                 if not party["members"]:
-                    timer = party.get("timer")
-                    if timer:
-                        timer.cancel()
                     room_parties.pop(owner_id, None)
                     cancelled_titles.append(party["title"])
                 else:
@@ -548,36 +763,95 @@ def leave_party(chat: ChatContext):
 
         msg_lines = []
         if left_titles:
-            msg_lines.append(
-                "다음 파티에서 나갔습니다:\n- " + "\n- ".join(left_titles)
-            )
+            msg_lines.append("나간 파티:")
+            msg_lines += [f"- {t}" for t in left_titles]
         if cancelled_titles:
-            msg_lines.append(
-                "다음 파티는 더 이상 멤버가 없어 취소되었습니다(또는 본인이 파티장이어서 삭제됨):\n- "
-                + "\n- ".join(cancelled_titles)
-            )
+            msg_lines.append("삭제된 파티:")
+            msg_lines += [f"- {t}" for t in cancelled_titles]
         if not msg_lines:
-            msg_lines.append("변경된 파티가 없습니다.")
+            msg_lines.append("변경된 파티가 없어요.")
 
-        chat.reply("\n\n".join(msg_lines))
+        chat.reply("\n".join(msg_lines))
+
+
+def promote_party(chat: ChatContext):
+    """
+    /파티홍보 명령 처리
+    - 파티장만 사용 가능
+    """
+    _ensure_today_state()
+
+    room_id = _get_room_id(chat)
+    owner_id = chat.sender.id
+
+    with PARTY_LOCK:
+        room_parties = PARTY_STATE.get(room_id)
+        if not room_parties or owner_id not in room_parties:
+            chat.reply("먼저 `/파티 제목` 으로 파티를 만들어 주세요.")
+            return
+
+        party = room_parties[owner_id]
+        table = _format_party_table(party)
+
+        msg_lines = [
+                        "📣 파티 홍보!",
+                        "",
+                        table,
+                    ] + _join_help_lines()
+
+        chat.reply("\n".join(msg_lines))
+
+def show_help(chat: ChatContext):
+    """ /파티도움말 명령 처리 """
+    lines = [
+        "📚 [파티 봇 도움말]",
+        "",
+        "✅ 파티 생성/관리",
+        "• /파티 [제목] [직업] [본/부] : 4인 파티 생성",
+        "• /레이드파티 [제목] [직업] [본/부] : 8인 파티 생성",
+        "• /파티삭제 : 내가 만든 파티 삭제",
+        "• /파티홍보 : 현재 파티 정보 띄우기",
+        "",
+        "✅ 참여/탈퇴",
+        "• /파티참여 [번호] [직업] [본/부] : 파티 참여",
+        "• /파티탈퇴 : 참여 중인 파티 나가기",
+        "",
+        "✅ 파티장 전용",
+        "• /파티멤버추가 [이름] [직업] [본/부] : 멤버 강제 추가",
+        "• /파티추방 [번호] : 멤버 내보내기",
+        "",
+        "✅ 조회",
+        "• /파티목록 : 전체 파티 목록 보기",
+        "• /파티도움말 : 명령어 목록 보기"
+    ]
+    chat.reply("\n".join(lines))
 
 
 def handle_party_command(chat: ChatContext):
     """
-    메인 봇에서 `/파티`, `/레이드파티`, `/참가`, `/파티현황`, `/파티취소`, `/파티삭제`
-    다 이 함수 하나로 라우팅.
+    메인 봇 명령어 라우팅
     """
+    _ensure_today_state()
+
     cmd = chat.message.command
 
     if cmd == "/파티":
         create_party(chat)
     elif cmd == "/레이드파티":
         create_raid_party(chat)
-    elif cmd == "/참가":
+    elif cmd in ("/파티참가", "/파티참여", "/참가", "/참여"):
         join_party(chat)
-    elif cmd == "/파티현황":
+    elif cmd in ("/파티목록", "/파티현황"):
         show_party_status(chat)
-    elif cmd == "/파티취소":
+    elif cmd in ("/파티탈퇴", "/파티취소"):
         leave_party(chat)
     elif cmd == "/파티삭제":
         delete_party(chat)
+    elif cmd == "/파티맴버추가":
+        add_member_by_master(chat)
+    elif cmd == "/파티홍보":
+        promote_party(chat)
+    elif cmd == "/파티추방":
+        kick_member(chat)
+    elif cmd in ("/파티도움말", "/파티명령어"):
+        show_help(chat)
