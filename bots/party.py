@@ -777,29 +777,52 @@ def leave_party(chat: ChatContext):
 def promote_party(chat: ChatContext):
     """
     /파티홍보 명령 처리
-    - 파티장만 사용 가능
+    - 파티장 + 파티원 모두 사용 가능
     """
     _ensure_today_state()
 
     room_id = _get_room_id(chat)
-    owner_id = chat.sender.id
+    user_id = chat.sender.id
+    user_name = _get_user_name(chat.sender)
 
     with PARTY_LOCK:
         room_parties = PARTY_STATE.get(room_id)
-        if not room_parties or owner_id not in room_parties:
+        if not room_parties:
             chat.reply("먼저 `/파티 제목` 으로 파티를 만들어 주세요.")
             return
 
-        party = room_parties[owner_id]
+        party = None
+
+        # 1) 내가 파티장인 경우 → 내 파티 우선
+        if user_id in room_parties:
+            party = room_parties[user_id]
+        else:
+            # 2) 파티장은 아니지만, 멤버로 들어가 있는 파티 찾기
+            for _owner_id, p in room_parties.items():
+                if any(m.get("id") == user_id for m in p.get("members", [])):
+                    party = p
+                    break
+
+        if not party:
+            chat.reply("현재 홍보할 수 있는 파티가 없어요.\n(파티에 먼저 참가해 주세요)")
+            return
+
         table = _format_party_table(party)
 
+        # 파티장이 아닌 파티원이 홍보한 경우, 누가 요청했는지 표시
+        if party.get("owner_id") != user_id:
+            header = f"📣 파티 홍보! (요청자: {_truncate(user_name, 10)})"
+        else:
+            header = "📣 파티 홍보!"
+
         msg_lines = [
-                        "📣 파티 홍보!",
-                        "",
-                        table,
-                    ] + _join_help_lines()
+            header,
+            "",
+            table,
+        ] + _join_help_lines()
 
         chat.reply("\n".join(msg_lines))
+
 
 def show_help(chat: ChatContext):
     """ /파티도움말 명령 처리 """
@@ -847,7 +870,7 @@ def handle_party_command(chat: ChatContext):
         leave_party(chat)
     elif cmd == "/파티삭제":
         delete_party(chat)
-    elif cmd == "/파티맴버추가":
+    elif cmd == "/파티멤버추가":
         add_member_by_master(chat)
     elif cmd == "/파티홍보":
         promote_party(chat)
