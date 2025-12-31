@@ -14,19 +14,27 @@ from iris import ChatContext
 PARTY_STATE: Dict[int, Dict[int, Dict[str, Any]]] = {}
 PARTY_LOCK = threading.RLock()
 
-# 파티 ID 시퀀스 (전역 증가 숫자)
-_PARTY_ID_SEQ = 1
 
 # 마지막으로 파티 상태를 사용한 "날짜"
 # - 날짜가 바뀌면(자정 지나면) PARTY_STATE 를 전부 초기화한다.
 _PARTY_STATE_DATE: Optional[date] = None
 
 
-def _next_party_id() -> int:
-    """새 파티 ID 발급 (전역 증가 숫자)."""
-    global _PARTY_ID_SEQ
-    pid = _PARTY_ID_SEQ
-    _PARTY_ID_SEQ += 1
+def _next_party_id(room_id: int) -> int:
+    """
+    해당 방(room_id)에서 사용 중인 파티 번호를 확인하고,
+    1번부터 시작하여 비어있는 가장 낮은 번호를 반환합니다.
+    """
+    room_parties = PARTY_STATE.get(room_id, {})
+
+    # 현재 이 방에 있는 파티들의 ID만 모음
+    used_ids = {p.get("party_id", 0) for p in room_parties.values()}
+
+    # 1부터 숫자를 키워가며 사용 중이지 않은 번호를 찾음
+    pid = 1
+    while pid in used_ids:
+        pid += 1
+
     return pid
 
 
@@ -277,7 +285,7 @@ def create_party(chat: ChatContext):
             chat.reply("\n".join(msg_lines))
             return
 
-        party_id = _next_party_id()
+        party_id = _next_party_id(room_id)
 
         creator = {
             "id": owner_id,
@@ -334,7 +342,7 @@ def create_raid_party(chat: ChatContext):
             chat.reply("\n".join(msg_lines))
             return
 
-        party_id = _next_party_id()
+        party_id = _next_party_id(room_id)
 
         creator = {
             "id": owner_id,
@@ -527,8 +535,11 @@ def join_party(chat: ChatContext):
         cls: Optional[str] = None
         is_main: Optional[bool] = None
 
+        # ──────────────────────
+        # 1) 파티 찾기 및 파라미터 파싱
+        # ──────────────────────
         if tokens:
-            # 1-1) 첫 토큰이 숫자면 → 파티 ID
+            # 1-1) 첫 토큰이 숫자면 → 파티 ID로 찾기
             if tokens[0].isdigit():
                 target_party_id = int(tokens[0])
                 for oid, p in room_parties.items():
@@ -567,7 +578,7 @@ def join_party(chat: ChatContext):
                     party = room_parties.get(target_owner_id)
                     cls, is_main = _extract_cls_and_main(tokens[1:])
         else:
-            # 1-3) 파라미터가 없을 때
+            # 1-3) 파라미터가 없을 때 (파티가 1개면 자동 선택)
             if len(room_parties) == 1:
                 target_owner_id = next(iter(room_parties.keys()))
                 party = room_parties[target_owner_id]
@@ -607,13 +618,13 @@ def join_party(chat: ChatContext):
             if is_main is not None:
                 member["is_main"] = is_main
 
-            is_main_flag = member.get("is_main")
-            if is_main_flag is None:
-                is_main_flag = (existing_index == 0)
+            # 수정 시점에서도 값이 없으면 True(본캐)로 간주
+            is_main_flag = member.get("is_main", True)
 
             my_role_label = "본케" if is_main_flag else "부케"
             table = _format_party_table(party)
 
+            header = ""
             if cls and cls != old_cls:
                 header = f"✅ 직업을 {cls} 로 수정했어요."
             elif is_main is not None and is_main != old_is_main:
@@ -634,7 +645,7 @@ def join_party(chat: ChatContext):
             return
 
         # ──────────────────────
-        # 3) 새로 참가하는 경우
+        # 3) 새로 참가하는 경우 (수정된 로직)
         # ──────────────────────
         if len(party["members"]) >= party["max_members"]:
             chat.reply(
@@ -649,16 +660,16 @@ def join_party(chat: ChatContext):
             "cls": cls,
         }
 
+        # [수정됨] is_main이 입력되지 않았다면(None) -> 기본값 True(본캐) 설정
         if is_main is not None:
             member["is_main"] = is_main
+        else:
+            member["is_main"] = True
 
         party["members"].append(member)
 
-        my_index = len(party["members"]) - 1
-        is_main_flag = member.get("is_main")
-        if is_main_flag is None:
-            is_main_flag = (my_index == 0)
-
+        # 표시용 변수 설정
+        is_main_flag = member["is_main"]
         my_role_label = "본케" if is_main_flag else "부케"
         kind_str = "레이드 파티" if party.get("is_raid") else "파티"
         table = _format_party_table(party)
