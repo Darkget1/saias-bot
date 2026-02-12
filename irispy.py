@@ -16,6 +16,7 @@ from iris.kakaolink import IrisLink
 from bots.detect_nickname_change import detect_nickname_change
 import sys, threading, random
 from bots.party import handle_party_command
+from bots.user_system import handle_user_commands,start_lotto_scheduler
 from bots.game_369 import handle_369_command, handle_369_turn  # ✅ 추가
 iris_url = sys.argv[1]
 bot = Bot(iris_url)
@@ -211,7 +212,8 @@ def giveup_nonsense_quiz(chat: ChatContext):
 def on_message(chat: ChatContext):
     try:
         cmd = chat.message.command
-
+        if handle_user_commands(chat):
+            return
         # ✅ 1) 369 명령어 먼저 처리
         if handle_369_command(chat):
             # 명령어 처리 후에도 일반 턴 체크 (바로 다음 사람이 이어서 칠 수 있게)
@@ -312,6 +314,7 @@ if __name__ == "__main__":
         args=(bot.iris_url,),
     )
     nickname_detect_thread.start()
+    start_lotto_scheduler(bot)
 
     # 카카오링크를 사용하지 않는 경우 주석처리
     kl = IrisLink(bot.iris_url)
