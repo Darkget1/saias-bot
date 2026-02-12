@@ -93,7 +93,6 @@ def init_db():
                 """)
 
 
-
         cur.execute("PRAGMA table_info(lotto)")
         if 'room_id' not in [c[1] for c in cur.fetchall()]:
             cur.execute("ALTER TABLE lotto ADD COLUMN room_id TEXT")
@@ -581,6 +580,7 @@ def handle_user_commands(chat: ChatContext):
         # 관리자 전용: 상점 아이템 추가
         # ─────────────────────────────
         if cmd == "/상점추가":
+            print(user['user_id'],user['name'])
             if chat.sender.id not in ADMIN_LIST:
                 return False
 
