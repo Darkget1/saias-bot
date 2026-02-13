@@ -451,6 +451,56 @@ def handle_user_commands(chat: ChatContext):
             chat.reply("\n".join(msg))
             return True
 
+        # ─────────────────────────────
+        # 채팅 순위표 출력 (상위 10명)
+        # ─────────────────────────────
+        if cmd == "/채팅순위":
+            with DB_LOCK:
+                conn = get_db_conn()
+                cur = conn.cursor()
+
+                # 1. 전체 유저의 채팅 총합 계산 (점유율 계산용)
+                cur.execute("SELECT SUM(total_chat) FROM users")
+                total_sum_row = cur.fetchone()
+                total_sum = total_sum_row[0] if total_sum_row and total_sum_row[0] > 0 else 1
+
+                # 2. total_chat 기준 내림차순 정렬, 상위 15명 추출
+                cur.execute("""
+                                SELECT name, total_chat, job 
+                                FROM users 
+                                ORDER BY total_chat DESC 
+                                LIMIT 15
+                            """)
+                rows = cur.fetchall()
+                conn.close()
+
+            if not rows:
+                chat.reply("데이터가 충분하지 않습니다.")
+                return True
+
+            rank_msg = ["🏆 [ 전체 채팅 순위 TOP 15 ]", "────────"]
+
+            # 메달 이모지 리스트
+            medals = ["🥇", "🥈", "🥉"] + ["✨"] * 12
+
+            for i, row in enumerate(rows):
+                rank = i + 1
+                medal = medals[i]
+
+                # 점유율 계산 (개인 채팅 / 전체 채팅 * 100)
+                share = (row['total_chat'] / total_sum) * 100
+
+                # 출력 형식: 🥇 1위: 이름 [직업] (점유율%)
+                rank_msg.append(f"{rank}위: {row['name']}")
+                rank_msg.append(f"   ㄴ 누적 채팅: {row['total_chat']:,}회 ({share:.1f}%)")
+
+            rank_msg.append("────────")
+            rank_msg.append(f"📊 전체 누적 채팅수: {total_sum:,}회")
+            rank_msg.append(f"💡 현재 1위는 {rows[0]['name']}님입니다!")
+
+            chat.reply("\n".join(rank_msg))
+            return True
+
         if cmd == "/복권자동":
             room_id = str(chat.room.id)
             today = datetime.now(KST).date().isoformat()
