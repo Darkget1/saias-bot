@@ -14,7 +14,6 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 admin_raw = os.getenv("ADMIN_IDS", "")
 # 공백 제거 후 정수형(int) 리스트로 생성
 ADMIN_LIST = [int(aid.strip()) for aid in admin_raw.split(",") if aid.strip()]
-print(ADMIN_LIST)
 # ─────────────────────────────
 # 설정 및 DB 연결
 # ─────────────────────────────
@@ -631,7 +630,6 @@ def handle_user_commands(chat: ChatContext):
         # 관리자 전용: 상점 아이템 추가
         # ─────────────────────────────
         if cmd == "/상점추가":
-
             if chat.sender.id not in ADMIN_LIST:
                 print("관리자가 아닙니다.",chat.sender.id)
                 return False
@@ -708,6 +706,60 @@ def handle_user_commands(chat: ChatContext):
                         chat.reply(f"❌ 삭제 중 오류 발생: {e}")
 
                 conn.close()
+            return True
+        # ─────────────────────────────
+        # 관리자 전용: 전체 유저 포인트 및 아이템 정보 조회
+        # ─────────────────────────────
+        if cmd == "/포인트정보":
+            # 관리자 권한 체크
+            if chat.sender.id not in ADMIN_LIST:
+                return False
+
+            with DB_LOCK:
+                conn = get_db_conn()
+                cur = conn.cursor()
+
+                # 1. 전체 유저 정보 가져오기 (포인트가 많은 순으로 정렬)
+                cur.execute("SELECT user_id, name, points FROM users ORDER BY points DESC")
+                all_users = cur.fetchall()
+
+                # 2. 전체 인벤토리 정보 가져오기
+                cur.execute("""
+                            SELECT inv.user_id, i.item_name, inv.quantity 
+                            FROM inventory inv 
+                            JOIN items i ON inv.item_id = i.item_id 
+                            WHERE inv.quantity > 0
+                        """)
+                all_inventory = cur.fetchall()
+                conn.close()
+
+            if not all_users:
+                chat.reply("⚠️ 등록된 유저가 없습니다.")
+                return True
+
+            # 3. 인벤토리 데이터를 user_id를 키값으로 딕셔너리에 묶기
+            user_items_map = {}
+            for inv in all_inventory:
+                uid = inv['user_id']
+                if uid not in user_items_map:
+                    user_items_map[uid] = []
+                user_items_map[uid].append(f"{inv['item_name']}({inv['quantity']})")
+
+            # 4. 출력 메시지 구성
+            info_msg = ["👑 [ 유저 포인트 & 아이템 현황 ]", "────────"]
+
+            for u in all_users:
+                uid = u['user_id']
+                # 해당 유저의 아이템 리스트 가져오기 (없으면 '없음' 처리)
+                items_str = ", ".join(user_items_map.get(uid, ["없음"]))
+
+                info_msg.append(f"👤 {u['name']} (🅟{u['points']:,})")
+                info_msg.append(f"   ㄴ 📦 아이템: {items_str}")
+
+            info_msg.append("────────")
+
+            # 메시지가 너무 길 경우를 대비해 전송 (카카오톡 등 플랫폼 제한 주의)
+            chat.reply("\n".join(info_msg))
             return True
 
 
