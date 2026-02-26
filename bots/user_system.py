@@ -14,6 +14,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 admin_raw = os.getenv("ADMIN_IDS", "")
 # 공백 제거 후 정수형(int) 리스트로 생성
 ADMIN_LIST = [int(aid.strip()) for aid in admin_raw.split(",") if aid.strip()]
+print(ADMIN_LIST)
 # ─────────────────────────────
 # 설정 및 DB 연결
 # ─────────────────────────────
@@ -630,8 +631,9 @@ def handle_user_commands(chat: ChatContext):
         # 관리자 전용: 상점 아이템 추가
         # ─────────────────────────────
         if cmd == "/상점추가":
-            print(user['user_id'],user['name'])
+
             if chat.sender.id not in ADMIN_LIST:
+                print("관리자가 아닙니다.",chat.sender.id)
                 return False
 
                 # 형식: /상점추가 [아이템명] [가격] [설명]
