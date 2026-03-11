@@ -9,6 +9,7 @@ from bots.replyphoto import reply_photo
 from bots.text2image import draw_text
 from bots.coin import get_coin_info
 
+
 from iris.decorators import *
 from helper.BanControl import ban_user, unban_user
 from iris.kakaolink import IrisLink
@@ -16,8 +17,9 @@ from iris.kakaolink import IrisLink
 from bots.detect_nickname_change import detect_nickname_change
 import sys, threading, random
 from bots.party import handle_party_command
+from bots.event import handle_event_command
 from bots.user_system import handle_user_commands,start_lotto_scheduler
-from bots.game_369 import handle_369_command, handle_369_turn  # ✅ 추가
+from bots.game import handle_game_input,handle_369_command,handle_reaction_command
 iris_url = sys.argv[1]
 bot = Bot(iris_url)
 
@@ -207,86 +209,44 @@ def giveup_nonsense_quiz(chat: ChatContext):
     NONSENSE_STATE.pop(room_id, None)
 
 
+
 @bot.on_event("message")
 @is_not_banned
 def on_message(chat: ChatContext):
     try:
-        cmd = chat.message.command
-        if handle_user_commands(chat):
-            return
-        # ✅ 1) 369 명령어 먼저 처리
-        if handle_369_command(chat):
-            # 명령어 처리 후에도 일반 턴 체크 (바로 다음 사람이 이어서 칠 수 있게)
-            handle_369_turn(chat)
-            return
-
-        # ✅ 2) 나머지 기존 명령어 처리
+        # command 속성이 없을 수도 있으니 getattr로 안전하게 가져오는 것을 추천합니다.
+        cmd = getattr(chat.message, "command", None)
+        # if handle_user_commands(chat):
+        #     return
         match cmd:
-
-            case "!hhi":
-                chat.reply(f"Hello {chat.sender.name}")
-
-            case "!tt" | "!ttt" | "!프사" | "!프사링":
-                reply_photo(chat, kl)
-
-            case "!iris":
-                chat.reply_media("res/help.png")
-
-            case "!gi" | "!i2i" | "!분석":
-                get_gemini(chat)
-
-            case "!ipy":
-                python_eval(chat)
-
-            case "!iev":
-                real_eval(chat, kl)
-
-            case "!ban":
-                ban_user(chat)
-
-            case "!unban":
-                unban_user(chat)
-
-            case "!주식":
-                create_stock_image(chat)
-
-            case "!ig":
-                get_imagen(chat)
-
-            case "!가사찾기":
-                find_lyrics(chat)
-
-            case "!노래가사":
-                get_lyrics(chat)
-
-            case "!텍스트" | "!사진" | "!껄무새" | "!멈춰" | "!지워" | "!진행" | "!말대꾸" | "!텍스트추가" | "!업로드":
-                draw_text(chat)
-
-            case "!코인" | "!내코인" | "!바낸" | "!김프" | "!달러" | "!코인등록" | "!코인삭제":
-                get_coin_info(chat)
-
+            case "ㅊㅊ" | "/ㅊㅊ" | "!ㅊㅊ" | "/내정보" | "/채팅순위" | "/복권자동" | "/복권정보" | "/상점" | "/구매" | "/상점추가" | "/상점삭제" | "/포인트정보":
+                handle_user_commands(chat)
             case "/넌센스":
                 start_nonsense_quiz(chat)
-
             case "/답":
                 check_nonsense_answer(chat)
-
             case "/포기":
                 giveup_nonsense_quiz(chat)
 
-            case "/파티" | "/파티참가" | "/파티참여"| "/파티목록" | "/파티탈퇴" | "/파티삭제" | "/레이드파티"|"/파티홍보"|"/파티멤버추가"|"/파티추방"|"/파티도움말":
+            case "/파티" | "/파티참가" | "/파티참여" | "/파티목록" | "/파티탈퇴" | "/파티삭제" | "/레이드파티" | "/파티홍보" | "/파티멤버추가" | "/파티추방" | "/파티도움말":
                 handle_party_command(chat)
 
-            case _:
-                # 369 이외의 일반 텍스트는 여기로 떨어짐
-                pass
+            case "/이벤트생성" | "/내이벤트" | "/이벤트삭제" | "/참여" | "/이벤트참여" | "/이벤트참가" | "/이벤트탈퇴" | "/이벤트취소" | "/이벤트목록" | "/이벤트현황" | "/이벤트도움말":
+                handle_event_command(chat)
 
-        # ✅ 3) 일반 메시지에 대해서 369 턴 처리
-        handle_369_turn(chat)
+            case "/반응게임" | "/반응게임참여" | "/반응게임시작":
+                handle_reaction_command(chat)
+
+            case "/369시작" | "/369끝" | "/369상태":
+                handle_369_command(chat)
+
+            case _:
+                # 위에서 정의한 명령어(/)가 아닌 모든 일반 채팅(숫자, 'ㅉ' 등)은
+                # 여기서 통합으로 처리합니다.
+                handle_game_input(chat)
 
     except Exception as e:
-        print(e)
-
+        print(f"Error in on_message: {e}")
 # 입장감지
 @bot.on_event("new_member")
 def on_newmem(chat: ChatContext):
