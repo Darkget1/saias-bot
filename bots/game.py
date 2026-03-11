@@ -10,7 +10,7 @@ from bots.user_system import get_db_conn, DB_LOCK
 # ─────────────────────────────
 # 게임 포인트 지급 설정 (테스트 중에는 False, 나중에 True로 변경)
 # ─────────────────────────────
-# ENABLE_GAME_REWARD = True
+ENABLE_GAME_REWARD = False
 
 # ─────────────────────────────
 # 통합 게임 상태 관리
