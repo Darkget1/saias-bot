@@ -79,7 +79,7 @@ def handle_reaction_command(chat: ChatContext):
 
         elif cmd == "/반응게임시작":
             if state["current_game"] != "REACTION" or state["data"]["status"] != "WAITING": return
-            if len(state["data"]["members"]) < 1:
+            if len(state["data"]["members"]) < 2:
                 chat.reply("❌ 최소 2명 이상 참여해야 합니다.")
                 return
             state["data"]["status"] = "RUNNING"
