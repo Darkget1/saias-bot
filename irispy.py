@@ -19,7 +19,7 @@ import sys, threading, random
 from bots.party import handle_party_command
 from bots.event import handle_event_command
 from bots.user_system import handle_user_commands,start_lotto_scheduler
-from bots.game import handle_game_input,handle_369_command,handle_reaction_command
+from bots.game import handle_game_input,handle_369_command,handle_reaction_command,handle_game_cancel
 iris_url = sys.argv[1]
 bot = Bot(iris_url)
 
@@ -239,7 +239,8 @@ def on_message(chat: ChatContext):
 
             case "/369시작" | "/369끝" | "/369상태":
                 handle_369_command(chat)
-
+            case "/게임삭제" | "/게임취소":
+                handle_game_cancel(chat)
             case _:
                 # 위에서 정의한 명령어(/)가 아닌 모든 일반 채팅(숫자, 'ㅉ' 등)은
                 # 여기서 통합으로 처리합니다.

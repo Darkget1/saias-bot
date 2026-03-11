@@ -32,7 +32,7 @@ def _extract_text(chat: ChatContext) -> str:
     msg = chat.message
     if isinstance(msg, str):
         return msg.strip()
-    print(msg)
+
     # 텍스트, 내용, 혹은 명령어로 파싱된 값까지 모두 긁어옵니다.
     text = getattr(msg, "text", "") or getattr(msg, "content", "") or getattr(msg, "command", "")
     return str(text).strip()
@@ -49,11 +49,15 @@ def handle_reaction_command(chat: ChatContext):
     with GAME_LOCK:
         if cmd == "/반응게임":
             if state["current_game"]:
-                chat.reply(f"⚠️ 이미 {state['current_game']} 게임이 진행 중입니다.")
+                # 👇 영어 게임 코드를 한글 이름으로 변환
+                game_names_kr = {"REACTION": "반응 속도", "369": "369"}
+                display_name = game_names_kr.get(state["current_game"], state["current_game"])
+                chat.reply(f"⚠️ 이미 [{display_name}] 게임이 진행 중입니다.")
                 return
             state["current_game"] = "REACTION"
-            state["data"] = {"status": "WAITING", "members": [], "current_idx": 0, "results": []}
-            chat.reply("🎮 [반응 속도 게임] 모집!\n참여: /반응게임참여\n시작: /반응게임시작 (2명 이상)")
+            # 👇 creator_id 추가
+            state["data"] = {"status": "WAITING", "members": [], "current_idx": 0, "results": [], "creator_id": str(chat.sender.id)}
+            chat.reply("🎮 [반응 속도 게임] 모집!\n참여: /반응게임참여\n시작: /반응게임시작 (2명 이상)\n취소: /게임삭제")
 
         elif cmd == "/반응게임참여":
             if state["current_game"] != "REACTION" or state["data"]["status"] != "WAITING": return
@@ -64,7 +68,7 @@ def handle_reaction_command(chat: ChatContext):
 
         elif cmd == "/반응게임시작":
             if state["current_game"] != "REACTION" or state["data"]["status"] != "WAITING": return
-            if len(state["data"]["members"]) < 1:
+            if len(state["data"]["members"]) < 2:
                 chat.reply("❌ 최소 2명 이상 참여해야 합니다.")
                 return
             state["data"]["status"] = "RUNNING"
@@ -116,15 +120,19 @@ def _finish_reaction(chat: ChatContext, state: Dict[str, Any]):
 def handle_369_command(chat: ChatContext):
     room_id = chat.room.id
     state = _get_game_state(room_id)
-    cmd = chat.message.command
+    cmd = getattr(chat.message, "command", "")
 
     with GAME_LOCK:
         if cmd == "/369시작":
             if state["current_game"]:
-                chat.reply(f"⚠️ 이미 {state['current_game']} 게임이 진행 중입니다.")
+                # 👇 영어 게임 코드를 한글 이름으로 변환
+                game_names_kr = {"REACTION": "반응 속도", "369": "369"}
+                display_name = game_names_kr.get(state["current_game"], state["current_game"])
+                chat.reply(f"⚠️ 이미 [{display_name}] 게임이 진행 중입니다.")
                 return
             state["current_game"] = "369"
-            state["data"] = {"current": 1}
+            # 👇 creator_id 추가
+            state["data"] = {"current": 1, "creator_id": str(chat.sender.id)}
             chat.reply("🎉 369 시작! 봇부터 시작할게 👉 [봇] 1")
             return True
         elif cmd == "/369끝":
@@ -132,6 +140,45 @@ def handle_369_command(chat: ChatContext):
             chat.reply("🛑 369 종료")
             return True
     return False
+# ─────────────────────────────
+# [공통] 게임삭제
+# ─────────────────────────────
+
+def handle_game_cancel(chat: ChatContext):
+    """게임을 만든 사람만 게임을 강제 종료하는 기능"""
+    room_id = chat.room.id
+    state = _get_game_state(room_id)
+
+    with GAME_LOCK:
+        if not state["current_game"]:
+            chat.reply("⚠️ 현재 진행 중이거나 모집 중인 게임이 없습니다.")
+            return True
+
+        creator_id = state["data"].get("creator_id")
+        sender_id = str(chat.sender.id)
+
+        # 만든 사람인지 확인 (만약 봇 관리자도 지울 수 있게 하려면 or sender_id in ADMIN_LIST 추가 가능)
+        if creator_id and sender_id != creator_id:
+            chat.reply("❌ 게임을 시작한 사람만 삭제(취소)할 수 있습니다.")
+            return True
+
+        # 👇 영어 게임 코드를 한글 이름으로 변환하는 부분
+        game_names_kr = {
+            "REACTION": "반응 속도",
+            "369": "369"
+        }
+
+        raw_game_name = state["current_game"]
+        # 사전에 정의된 이름이 있으면 가져오고, 없으면 원래 영문 이름 출력
+        display_name = game_names_kr.get(raw_game_name, raw_game_name)
+
+        # 상태 초기화
+        state["current_game"] = None
+        state["data"] = {}
+
+        # 한글 이름으로 출력
+        chat.reply(f"🗑️ [{display_name}] 게임이 주최자에 의해 취소되었습니다.")
+        return True
 
 
 # ─────────────────────────────
