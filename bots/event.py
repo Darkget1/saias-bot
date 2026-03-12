@@ -77,7 +77,7 @@ def create_event(chat: ChatContext):
             "owner_name": _get_user_name(chat.sender),
             "members": []
         }
-        chat.reply(f"✅ 새 이벤트가 생성되었습니다!\n\n{_format_event_table(room_events[eid])}\n\n참여: /참여 {eid}")
+        chat.reply(f"✅ 새 이벤트가 생성되었습니다!\n\n{_format_event_table(room_events[eid])}\n\n참여: /이벤트참여 {eid}")
 
 
 def join_event(chat: ChatContext):
@@ -157,15 +157,85 @@ def show_event_help(chat: ChatContext):
         "✅ 이벤트 생성/관리",
         "• /이벤트생성 [제목] : 새 모집 시작",
         "• /내이벤트 : 내가 만든 목록 확인",
-        "• /이벤트삭제 [번호] : 모집 취소 (주최자만)",
+        "• /이벤트삭제 [이벤트번호] : 모집 취소 (주최자만)",
+        "• /이벤트멤버삭제 [이벤트번호] [참여자번호] : 특정 참여자 제외 (주최자만)",
         "",
         "✅ 참여하기",
-        "• /참여 [번호] : 명단에 이름 올리기",
+        "• /이벤트참여 [이벤트번호] : 명단에 이름 올리기",
+        "• /이벤트탈퇴 [이벤트번호] : 참여한 이벤트에서 빠지기",
         "• /이벤트목록 : 현재 모집 중인 이벤트 확인",
         "",
         "💡 방장이 이벤트를 만들어도 자동으로 참여되지 않으니, 생성 후 꼭 직접 [/참여 번호]를 입력해주세요!"
     ]
     chat.reply("\n".join(lines))
+
+
+def remove_event_member(chat: ChatContext):
+    """ /이벤트멤버삭제 [이벤트번호] [참여자번호] """
+    param = (getattr(chat.message, "param", "") or "").strip()
+    parts = param.split()
+
+    # 파라미터가 2개가 아니거나 둘 다 숫자가 아닌 경우
+    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        chat.reply("⚠️ 사용법: /이벤트멤버삭제 [이벤트번호] [참여자번호]\n예) /이벤트멤버삭제 1 2 (1번 이벤트의 2번째 참여자 삭제)")
+        return
+
+    eid = int(parts[0])
+    member_idx = int(parts[1])
+
+    with EVENT_LOCK:
+        room_events = EVENT_STATE.get(chat.room.id, {})
+        if eid not in room_events:
+            chat.reply(f"❌ {eid}번 이벤트를 찾을 수 없습니다.")
+            return
+
+        event = room_events[eid]
+
+        # 주최자 권한 확인
+        if event["owner_id"] != chat.sender.id:
+            chat.reply("❌ 주최자만 참여 멤버를 삭제할 수 있습니다.")
+            return
+
+        # 참여자 번호 유효성 검사 (1번부터 시작하므로)
+        if member_idx < 1 or member_idx > len(event["members"]):
+            chat.reply(f"❌ {member_idx}번 참여자를 찾을 수 없습니다. (현재 인원: {len(event['members'])}명)")
+            return
+
+        # 참여자 삭제 (리스트 인덱스는 0부터 시작하므로 member_idx - 1)
+        removed_member = event["members"].pop(member_idx - 1)
+
+        chat.reply(f"✅ '{removed_member['name']}'님을 이벤트 명단에서 제외했습니다.\n\n{_format_event_table(event)}")
+
+
+def leave_event(chat: ChatContext):
+    """ /이벤트탈퇴 [번호] """
+    param = (getattr(chat.message, "param", "") or "").strip()
+
+    if not param.isdigit():
+        chat.reply("⚠️ 탈퇴할 이벤트 번호를 입력해주세요.\n예) /이벤트탈퇴 1")
+        return
+
+    eid = int(param)
+    user_id = chat.sender.id
+
+    with EVENT_LOCK:
+        room_events = EVENT_STATE.get(chat.room.id, {})
+        if eid not in room_events:
+            chat.reply(f"❌ {eid}번 이벤트를 찾을 수 없습니다.")
+            return
+
+        event = room_events[eid]
+        original_count = len(event["members"])
+
+        # 본인 ID와 일치하지 않는 멤버들만 남김 (탈퇴 처리)
+        event["members"] = [m for m in event["members"] if m["id"] != user_id]
+
+        if len(event["members"]) == original_count:
+            chat.reply("❌ 해당 이벤트에 참여하고 있지 않습니다.")
+            return
+
+        chat.reply(f"✅ {event['title']} 이벤트에서 성공적으로 탈퇴했습니다.\n\n{_format_event_table(event)}")
+
 
 def handle_event_command(chat: ChatContext):
     cmd = chat.message.command
@@ -175,6 +245,10 @@ def handle_event_command(chat: ChatContext):
         join_event(chat)
     elif cmd == "/이벤트삭제":
         delete_event(chat)
+    elif cmd == "/이벤트멤버삭제":  # 추가됨
+        remove_event_member(chat)
+    elif cmd == "/이벤트탈퇴":      # 추가됨
+        leave_event(chat)
     elif cmd == "/내이벤트":
         show_my_events(chat)
     elif cmd in ("/이벤트목록", "/이벤트현황"):

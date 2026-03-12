@@ -54,35 +54,71 @@ def handle_reaction_command(chat: ChatContext):
     cmd = chat.message.command
 
     with GAME_LOCK:
-        if cmd == "/반응게임":
+        if cmd == "/반응참가":
+            user_id = chat.sender.id
+            user_name = _get_user_name(chat.sender)
+
+            # 1. 게임이 아예 없는 경우 -> 방 생성 및 자동 참여
+            if not state["current_game"]:
+                state["current_game"] = "REACTION"
+                state["data"] = {
+                    "status": "WAITING",
+                    "members": [{"id": user_id, "name": user_name}],
+                    "current_idx": 0,
+                    "results": [],
+                    "creator_id": str(user_id)  # 만든 사람 ID 저장
+                }
+
+                member_names = ", ".join([m["name"] for m in state["data"]["members"]])
+                chat.reply(
+                    f"🎮 [반응 속도 게임] 방이 생성되었습니다!\n"
+                    f"✅ {user_name}님 참여 완료\n\n"
+                    f"👥 현재 대기 인원 ({len(state['data']['members'])}명): {member_names}\n\n"
+                    f"👉 참여: /반응참가\n"
+                    f"👉 시작: /반응시작 (2명 이상)\n"
+                    f"👉 취소: /게임삭제"
+                )
+                return
+
+            # 2. 반응 게임 모집 중인 경우 -> 추가 참여
+            if state["current_game"] == "REACTION" and state["data"]["status"] == "WAITING":
+                # 이미 참여한 유저인지 확인
+                if any(m["id"] == user_id for m in state["data"]["members"]):
+                    member_names = ", ".join([m["name"] for m in state["data"]["members"]])
+                    chat.reply(f"⚠️ 이미 참여하셨습니다.\n👥 현재 대기 인원: {member_names}")
+                    return
+
+                # 새 멤버 추가
+                state["data"]["members"].append({"id": user_id, "name": user_name})
+                member_names = ", ".join([m["name"] for m in state["data"]["members"]])
+
+                chat.reply(
+                    f"✅ {user_name}님 참여!\n"
+                    f"👥 현재 대기 인원 ({len(state['data']['members'])}명): {member_names}"
+                )
+                return
+
+            # 3. 이미 게임이 진행 중이거나 다른 게임이 켜진 경우
             if state["current_game"]:
                 game_names_kr = {"REACTION": "반응 속도", "369": "369"}
                 display_name = game_names_kr.get(state["current_game"], state["current_game"])
-                chat.reply(f"⚠️ 이미 [{display_name}] 게임이 진행 중입니다.")
+                chat.reply(f"⚠️ 이미 [{display_name}] 게임이 진행/모집 중입니다.")
                 return
-            state["current_game"] = "REACTION"
-            state["data"] = {
-                "status": "WAITING",
-                "members": [],
-                "current_idx": 0,
-                "results": [],
-                "creator_id": str(chat.sender.id)  # 만든 사람 ID 저장
-            }
-            chat.reply("🎮 [반응 속도 게임] 모집!\n참여: /반응게임참여\n시작: /반응게임시작 (2명 이상)\n취소: /게임삭제")
 
-        elif cmd == "/반응게임참여":
-            if state["current_game"] != "REACTION" or state["data"]["status"] != "WAITING": return
-            user_id = chat.sender.id
-            if any(m["id"] == user_id for m in state["data"]["members"]): return
-            state["data"]["members"].append({"id": user_id, "name": _get_user_name(chat.sender)})
-            chat.reply(f"✅ {_get_user_name(chat.sender)}님 참여! (현재 {len(state['data']['members'])}명)")
+        elif cmd == "/반응시작":
+            if state["current_game"] != "REACTION" or state["data"]["status"] != "WAITING":
+                return
 
-        elif cmd == "/반응게임시작":
-            if state["current_game"] != "REACTION" or state["data"]["status"] != "WAITING": return
             if len(state["data"]["members"]) < 2:
-                chat.reply("❌ 최소 2명 이상 참여해야 합니다.")
+                chat.reply("❌ 최소 2명 이상 참여해야 시작할 수 있습니다.")
                 return
+
             state["data"]["status"] = "RUNNING"
+
+            # [추가된 부분] 게임 시작 직전에 멤버 순서를 무작위로 섞습니다.
+            random.shuffle(state["data"]["members"])
+
+            chat.reply("🚀 게임 시작! (순서는 랜덤으로 진행됩니다)\n집중하세요!")
             _reaction_next_turn(chat, state)
 
 
@@ -95,28 +131,31 @@ def _reaction_next_turn(chat: ChatContext, state: Dict[str, Any]):
     current_idx = data["current_idx"]
     current_name = data["members"][current_idx]["name"]
 
-    # 1. 턴 안내 메시지를 먼저 보냅니다.
+    # 1. 턴 안내 메시지를 보냅니다.
     chat.reply(f"👉 {current_idx + 1}. {current_name}님 준비...!")
 
-    # 2. 봇 멈춤 방지를 위해 별도 스레드에서 딜레이 후 번호를 띄웁니다.
-    def delayed_popup():
-        # 1.0초 ~ 3.0초 사이 랜덤 대기
-        time.sleep(random.uniform(1.0, 3.0))
+    # 2. 딜레이 없이 즉시 랜덤 번호 출제 및 시작 시간 측정
+    target_num = random.randint(10, 99)
+    state["data"]["target_num"] = target_num
+    state["data"]["start_time"] = time.time()
 
-        with GAME_LOCK:
-            # 대기하는 동안 게임이 취소되었거나 턴이 넘어갔는지 안전 확인
-            if state.get("current_game") != "REACTION" or state["data"].get("current_idx") != current_idx:
-                return
+    # 3. 헷갈리게 멘트를 여러 개 준비해서 랜덤으로 하나 선택
+    confusing_formats = [
+        f"🚨 [{target_num}] 🚨",
+        f"🔥 {target_num} 🔥 빨리!!",
+        f"👀 정답은 바로... [{target_num}]",
+        f"⚡ 삐빅! {target_num} ⚡",
+        f"🎯 과연 숫자는? >> {target_num} <<",
+        f"⚠️ [주의] {target_num} 입력!",
+        f"✨ {target_num} ✨",
+        f"🤔 ...{target_num}...",
+        f"💢 입력ㄱㄱ: {target_num}",
+        f"🎲 뽑힌 숫자: {target_num}"
+    ]
 
-            # 랜덤 번호 출제 및 시작 시간 측정
-            target_num = random.randint(10, 99)
-            state["data"]["target_num"] = target_num
-            state["data"]["start_time"] = time.time()
-
-            chat.reply(f"🚨 [{target_num}] 🚨")
-
-    # 스레드 실행
-    threading.Thread(target=delayed_popup, daemon=True).start()
+    # 랜덤으로 포맷을 골라서 출력
+    chosen_msg = random.choice(confusing_formats)
+    chat.reply(chosen_msg)
 
 
 def _finish_reaction(chat: ChatContext, state: Dict[str, Any]):
