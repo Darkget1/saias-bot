@@ -131,31 +131,41 @@ def _reaction_next_turn(chat: ChatContext, state: Dict[str, Any]):
     current_idx = data["current_idx"]
     current_name = data["members"][current_idx]["name"]
 
-    # 1. 턴 안내 메시지를 보냅니다.
+    # 1. 턴 안내 메시지 전송
     chat.reply(f"👉 {current_idx + 1}. {current_name}님 준비...!")
 
-    # 2. 딜레이 없이 즉시 랜덤 번호 출제 및 시작 시간 측정
-    target_num = random.randint(10, 99)
-    state["data"]["target_num"] = target_num
-    state["data"]["start_time"] = time.time()
+    # 2. 1~2초 사이의 랜덤한 지연 시간 설정 (float 단위로 세밀하게 조정)
+    delay = random.uniform(2.0, 3.0)
 
-    # 3. 헷갈리게 멘트를 여러 개 준비해서 랜덤으로 하나 선택
-    confusing_formats = [
-        f"🚨 [{target_num}] 🚨",
-        f"🔥 {target_num} 🔥 빨리!!",
-        f"👀 정답은 바로... [{target_num}]",
-        f"⚡ 삐빅! {target_num} ⚡",
-        f"🎯 과연 숫자는? >> {target_num} <<",
-        f"⚠️ [주의] {target_num} 입력!",
-        f"✨ {target_num} ✨",
-        f"🤔 ...{target_num}...",
-        f"💢 입력ㄱㄱ: {target_num}",
-        f"🎲 뽑힌 숫자: {target_num}"
-    ]
+    # 3. 실제 숫자 출제 함수를 별도로 정의하여 Timer로 실행
+    def display_target():
+        with GAME_LOCK:
+            # 게임이 도중에 취소되었는지 확인 (방어 코드)
+            if state["current_game"] != "REACTION" or data["status"] != "RUNNING":
+                return
 
-    # 랜덤으로 포맷을 골라서 출력
-    chosen_msg = random.choice(confusing_formats)
-    chat.reply(chosen_msg)
+            target_num = random.randint(10, 99)
+            state["data"]["target_num"] = target_num
+            state["data"]["start_time"] = time.time()
+
+            confusing_formats = [
+                f"🚨 [{target_num}] 🚨",
+                f"🔥 {target_num} 🔥 빨리!!",
+                f"👀 정답은 바로... [{target_num}]",
+                f"⚡ 삐빅! {target_num} ⚡",
+                f"🎯 과연 숫자는? >> {target_num} <<",
+                f"⚠️ [주의] {target_num} 입력!",
+                f"✨ {target_num} ✨",
+                f"🤔 ...{target_num}...",
+                f"💢 입력ㄱㄱ: {target_num}",
+                f"🎲 뽑힌 숫자: {target_num}"
+            ]
+
+            chosen_msg = random.choice(confusing_formats)
+            chat.reply(chosen_msg)
+
+    # 비동기 타이머 시작 (메인 스레드를 차단하지 않음)
+    threading.Timer(delay, display_target).start()
 
 
 def _finish_reaction(chat: ChatContext, state: Dict[str, Any]):
