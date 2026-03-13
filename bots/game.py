@@ -19,6 +19,32 @@ GAME_STATE: Dict[int, Dict[str, Any]] = {}
 GAME_LOCK = threading.RLock()
 
 
+def _reaction_timeout(chat: ChatContext, room_id: int, expected_idx: int):
+    """5초 동안 응답이 없을 경우 패배 처리하고 다음 턴으로 넘기는 함수"""
+    state = _get_game_state(room_id)
+    with GAME_LOCK:
+        # 게임이 취소되었거나 끝난 경우 중단
+        if state["current_game"] != "REACTION" or state.get("data", {}).get("status") != "RUNNING":
+            return
+
+        data = state["data"]
+        # 5초가 지났는데도 여전히 같은 차례(expected_idx)라면 응답을 안 한 것
+        if data["current_idx"] == expected_idx:
+            current_player = data["members"][expected_idx]
+
+            # 패배 처리 (99.99초로 기록하여 꼴찌로 만듦)
+            data["results"].append({
+                "id": current_player["id"],
+                "name": current_player["name"],
+                "time": 99.99
+            })
+
+            chat.reply(f"⏰ 5초 초과! {current_player['name']}님 응답 없음 (탈락)\n다음 사람으로 넘어갑니다.")
+
+            # 다음 사람으로 턴 넘기기
+            data["current_idx"] += 1
+            _reaction_next_turn(chat, state)
+
 def _get_game_state(room_id: int) -> Dict[str, Any]:
     with GAME_LOCK:
         if room_id not in GAME_STATE:
@@ -134,7 +160,7 @@ def _reaction_next_turn(chat: ChatContext, state: Dict[str, Any]):
     # 1. 턴 안내 메시지 전송
     chat.reply(f"👉 {current_idx + 1}. {current_name}님 준비...!")
 
-    # 2. 1~2초 사이의 랜덤한 지연 시간 설정 (float 단위로 세밀하게 조정)
+    # 2. 1~2초 사이의 랜덤한 지연 시간 설정
     delay = random.uniform(2.0, 3.0)
 
     # 3. 실제 숫자 출제 함수를 별도로 정의하여 Timer로 실행
@@ -147,6 +173,9 @@ def _reaction_next_turn(chat: ChatContext, state: Dict[str, Any]):
             target_num = random.randint(10, 99)
             state["data"]["target_num"] = target_num
             state["data"]["start_time"] = time.time()
+
+            # ★ [추가] 현재 누구의 차례인지 인덱스 저장
+            expected_idx = state["data"]["current_idx"]
 
             confusing_formats = [
                 f"🚨 [{target_num}] 🚨",
@@ -163,6 +192,9 @@ def _reaction_next_turn(chat: ChatContext, state: Dict[str, Any]):
 
             chosen_msg = random.choice(confusing_formats)
             chat.reply(chosen_msg)
+
+            # ★ [추가] 문제 출제 후 5초 타임아웃 타이머 시작
+            threading.Timer(5.0, _reaction_timeout, args=[chat, chat.room.id, expected_idx]).start()
 
     # 비동기 타이머 시작 (메인 스레드를 차단하지 않음)
     threading.Timer(delay, display_target).start()
