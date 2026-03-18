@@ -216,11 +216,9 @@ def on_message(chat: ChatContext):
     try:
         # command 속성이 없을 수도 있으니 getattr로 안전하게 가져오는 것을 추천합니다.
         cmd = getattr(chat.message, "command", None)
-        # if handle_user_commands(chat):
-        #     return
+        if handle_user_commands(chat):
+            return
         match cmd:
-            case "ㅊㅊ" | "/ㅊㅊ" | "!ㅊㅊ" | "/내정보" | "/채팅순위" | "/복권자동" | "/복권정보" | "/상점" | "/구매" | "/상점추가" | "/상점삭제" | "/포인트정보":
-                handle_user_commands(chat)
             case "/넌센스":
                 start_nonsense_quiz(chat)
             case "/답":
@@ -231,7 +229,7 @@ def on_message(chat: ChatContext):
             case "/파티" | "/파티참가" | "/파티참여" | "/파티목록" | "/파티탈퇴" | "/파티삭제" | "/레이드파티" | "/파티홍보" | "/파티멤버추가" | "/파티추방" | "/파티도움말":
                 handle_party_command(chat)
 
-            case "/이벤트생성" | "/내이벤트" | "/이벤트삭제" | "/이벤트참여" | "/이벤트참가" | "/이벤트탈퇴" | "/이벤트취소" | "/이벤트목록" | "/이벤트현황" | "/이벤트도움말"|"/이벤트멤버삭제"|"/이벤트탈퇴":
+            case "/이벤트생성" | "/내이벤트" | "/이벤트삭제" | "/이벤트참여" | "/이벤트참가" | "/이벤트탈퇴" | "/이벤트취소" | "/이벤트목록" | "/이벤트현황" | "/이벤트도움말"|"/이벤트멤버삭제"|"/이벤트탈퇴"|"/이벤트홍보":
                 handle_event_command(chat)
 
             case "/반응참가" | "/반응시작":

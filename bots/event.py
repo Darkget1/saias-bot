@@ -160,9 +160,10 @@ def show_event_help(chat: ChatContext):
         "• /이벤트삭제 [이벤트번호] : 모집 취소 (주최자만)",
         "• /이벤트멤버삭제 [이벤트번호] [참여자번호] : 특정 참여자 제외 (주최자만)",
         "",
-        "✅ 참여하기",
+        "✅ 참여 및 홍보",
         "• /이벤트참여 [이벤트번호] : 명단에 이름 올리기",
         "• /이벤트탈퇴 [이벤트번호] : 참여한 이벤트에서 빠지기",
+        "• /이벤트홍보 [이벤트번호] : 채팅방에 이벤트 다시 알리기 (주최자/참여자만)",
         "• /이벤트목록 : 현재 모집 중인 이벤트 확인",
         "",
         "💡 방장이 이벤트를 만들어도 자동으로 참여되지 않으니, 생성 후 꼭 직접 [/참여 번호]를 입력해주세요!"
@@ -237,6 +238,43 @@ def leave_event(chat: ChatContext):
         chat.reply(f"✅ {event['title']} 이벤트에서 성공적으로 탈퇴했습니다.\n\n{_format_event_table(event)}")
 
 
+def promote_event(chat: ChatContext):
+    """ /이벤트홍보 [번호] """
+    _ensure_today_state()
+    param = (getattr(chat.message, "param", "") or "").strip()
+
+    if not param.isdigit():
+        chat.reply("⚠️ 홍보할 이벤트 번호를 입력해주세요.\n예) /이벤트홍보 1")
+        return
+
+    eid = int(param)
+    user_id = chat.sender.id
+
+    with EVENT_LOCK:
+        room_events = EVENT_STATE.get(chat.room.id, {})
+        if eid not in room_events:
+            chat.reply(f"❌ {eid}번 이벤트를 찾을 수 없습니다.")
+            return
+
+        event = room_events[eid]
+
+        # 권한 확인: 주최자이거나 참여자 명단에 있는지 체크
+        is_owner = event["owner_id"] == user_id
+        is_member = any(m["id"] == user_id for m in event["members"])
+
+        if not (is_owner or is_member):
+            chat.reply("❌ 이벤트를 주최하거나 참여한 사람만 홍보할 수 있습니다.")
+            return
+
+        # 홍보 메시지 출력
+        reply_msg = (
+            f"📣 **[이벤트 홍보] 함께할 분들을 모집 중입니다!** 📣\n\n"
+            f"{_format_event_table(event)}\n\n"
+            f"👉 같이 하실 분은 `/참여 {eid}` 를 입력해주세요!"
+        )
+        chat.reply(reply_msg)
+
+
 def handle_event_command(chat: ChatContext):
     cmd = chat.message.command
     if cmd == "/이벤트생성":
@@ -249,6 +287,8 @@ def handle_event_command(chat: ChatContext):
         remove_event_member(chat)
     elif cmd == "/이벤트탈퇴":      # 추가됨
         leave_event(chat)
+    elif cmd == "/이벤트홍보":\
+            promote_event(chat)# 추가됨
     elif cmd == "/내이벤트":
         show_my_events(chat)
     elif cmd in ("/이벤트목록", "/이벤트현황"):
