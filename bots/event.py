@@ -15,11 +15,12 @@ _EVENT_STATE_DATE: Optional[date] = None
 
 
 def _ensure_today_state():
-    global EVENT_STATE, _EVENT_STATE_DATE
-    today = datetime.now().date()
-    if _EVENT_STATE_DATE != today:
-        EVENT_STATE.clear()
-        _EVENT_STATE_DATE = today
+    # global EVENT_STATE, _EVENT_STATE_DATE
+    # today = datetime.now().date()
+    # if _EVENT_STATE_DATE != today:
+    #     EVENT_STATE.clear()
+    #     _EVENT_STATE_DATE = today
+    pass
 
 
 def _next_event_id(room_id: int) -> int:
