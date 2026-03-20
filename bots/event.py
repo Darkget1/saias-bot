@@ -87,7 +87,7 @@ def join_event(chat: ChatContext):
     param = (getattr(chat.message, "param", "") or "").strip()
 
     if not param.isdigit():
-        chat.reply("⚠️ 참여할 이벤트 번호를 입력해주세요.\n예) /참여 1")
+        chat.reply("⚠️ 참여할 이벤트 번호를 입력해주세요.\n예) /이벤트참여 1")
         return
 
     eid = int(param)
@@ -137,7 +137,7 @@ def show_events_status(chat: ChatContext):
     for eid, ev in room_events.items():
         lines.append(f"#{eid} {ev['title']} ({len(ev['members'])}명)")
 
-    lines.append("\n/참여 [번호] 로 신청하세요!")
+    lines.append("\n/이벤트참여 [번호] 로 신청하세요!")
     chat.reply("\n".join(lines))
 
 
@@ -167,7 +167,7 @@ def show_event_help(chat: ChatContext):
         "• /이벤트홍보 [이벤트번호] : 채팅방에 이벤트 다시 알리기 (주최자/참여자만)",
         "• /이벤트목록 : 현재 모집 중인 이벤트 확인",
         "",
-        "💡 방장이 이벤트를 만들어도 자동으로 참여되지 않으니, 생성 후 꼭 직접 [/참여 번호]를 입력해주세요!"
+        "💡 방장이 이벤트를 만들어도 자동으로 참여되지 않으니, 생성 후 꼭 직접 [/이벤트참여 번호]를 입력해주세요!"
     ]
     chat.reply("\n".join(lines))
 
@@ -271,7 +271,7 @@ def promote_event(chat: ChatContext):
         reply_msg = (
             f"📣 **[이벤트 홍보] 함께할 분들을 모집 중입니다!** 📣\n\n"
             f"{_format_event_table(event)}\n\n"
-            f"👉 같이 하실 분은 `/참여 {eid}` 를 입력해주세요!"
+            f"👉 같이 하실 분은 `/이벤트참여 {eid}` 를 입력해주세요!"
         )
         chat.reply(reply_msg)
 
