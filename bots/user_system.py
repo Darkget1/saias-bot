@@ -761,6 +761,78 @@ def handle_user_commands(chat: ChatContext):
             # 메시지가 너무 길 경우를 대비해 전송 (카카오톡 등 플랫폼 제한 주의)
             chat.reply("\n".join(info_msg))
             return True
+        # ─────────────────────────────
+        # 관리자 전용: 유저 목록 조회
+        # ─────────────────────────────
+        if cmd == "/유저목록":
+            if chat.sender.id not in ADMIN_LIST:
+                return False
+
+            with DB_LOCK:
+                conn = get_db_conn()
+                cur = conn.cursor()
+                # 유저 이름순으로 정렬하여 보기 편하게 출력
+                cur.execute("SELECT name, job, points FROM users ORDER BY name ASC")
+                users = cur.fetchall()
+                conn.close()
+
+            if not users:
+                chat.reply("⚠️ 등록된 유저가 없습니다.")
+                return True
+
+            msg_lines = ["📋 [ 전체 유저 목록 ]", "────────"]
+            for u in users:
+                msg_lines.append(f"👤 {u['name']} [{u['job']}] - 🅟{u['points']:,}")
+            msg_lines.append("────────")
+            msg_lines.append("💡 삭제 방법: /유저삭제 [유저명]")
+
+            chat.reply("\n".join(msg_lines))
+            return True
+
+        # ─────────────────────────────
+        # 관리자 전용: 유저 삭제 (DB 데이터 일괄 삭제)
+        # ─────────────────────────────
+        if cmd == "/유저삭제":
+            if chat.sender.id not in ADMIN_LIST:
+                return False
+
+            target_name = getattr(chat.message, "param", "").strip()
+
+            if not target_name:
+                chat.reply("⚠️ 삭제할 유저명을 입력해주세요.\n예: /유저삭제 홍길동")
+                return True
+
+            with DB_LOCK:
+                conn = get_db_conn()
+                cur = conn.cursor()
+
+                # 1. 대상 유저 존재 여부 확인
+                cur.execute("SELECT user_id FROM users WHERE name = ?", (target_name,))
+                target_user = cur.fetchone()
+
+                if not target_user:
+                    chat.reply(f"❓ '{target_name}' 유저를 찾을 수 없습니다.")
+                    conn.close()
+                    return True
+
+                uid = target_user['user_id']
+
+                # 2. 연관된 모든 테이블에서 데이터 일괄 삭제 (트랜잭션 처리)
+                try:
+                    cur.execute("DELETE FROM inventory WHERE user_id = ?", (uid,))
+                    cur.execute("DELETE FROM lotto WHERE user_id = ?", (uid,))
+                    cur.execute("DELETE FROM name_logs WHERE user_id = ?", (uid,))
+                    cur.execute("DELETE FROM users WHERE user_id = ?", (uid,))
+                    conn.commit()
+
+                    chat.reply(f"🗑️ '{target_name}' 유저와 관련된 모든 데이터가 영구 삭제되었습니다.")
+                except Exception as e:
+                    conn.rollback()
+                    chat.reply(f"❌ 유저 삭제 중 오류 발생: {e}")
+                finally:
+                    conn.close()
+
+            return True
 
 
     except Exception as e:
