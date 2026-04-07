@@ -20,7 +20,7 @@ ADMIN_LIST = [int(aid.strip()) for aid in admin_raw.split(",") if aid.strip()]
 DB_FILE = "iris.db"
 DB_LOCK = threading.RLock()
 KST = pytz.timezone('Asia/Seoul')
-
+pending_deletions = {}
 
 def get_db_conn():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -346,14 +346,48 @@ def execute_probability_draw(bot):
 
 def handle_user_commands(chat: ChatContext):
     try:
-        user = _get_or_create_user(chat)
+        admin_id = chat.sender.id
+        msg_text = getattr(chat.message, "text", "").strip()
         cmd = getattr(chat.message, "command", "")
+
+        # ─────────────────────────────
+        # 관리자 전용: 삭제 최종 확인 (YES / NO)
+        # ─────────────────────────────
+        if admin_id in pending_deletions and msg_text in ["YES", "NO"]:
+            # 대기열에서 정보 꺼내기
+            target_info = pending_deletions.pop(admin_id)
+
+            if msg_text == "NO":
+                chat.reply("❌ 유저 삭제가 취소되었습니다.")
+                return True
+
+            if msg_text == "YES":
+                uid = target_info['target_uid']
+                exact_name = target_info['target_name']
+
+                with DB_LOCK:
+                    conn = get_db_conn()
+                    cur = conn.cursor()
+                    try:
+                        cur.execute("DELETE FROM inventory WHERE user_id = ?", (uid,))
+                        cur.execute("DELETE FROM lotto WHERE user_id = ?", (uid,))
+                        cur.execute("DELETE FROM name_logs WHERE user_id = ?", (uid,))
+                        cur.execute("DELETE FROM users WHERE user_id = ?", (uid,))
+                        conn.commit()
+                        chat.reply(f"🗑️ '{exact_name}' 유저의 모든 데이터가 영구 삭제되었습니다.")
+                    except Exception as e:
+                        conn.rollback()
+                        chat.reply(f"❌ 유저 삭제 중 오류 발생: {e}")
+                    finally:
+                        conn.close()
+                return True
+
+        user = _get_or_create_user(chat)
 
         if cmd == "ㅊㅊ" or cmd in ["/ㅊㅊ", "!ㅊㅊ"]:
             today_str = datetime.now(KST).date().isoformat()
 
             if user['last_checkin_date'] == today_str:
-                # ✅ 이미 출석한 경우에도 현재 기록을 보여줌
                 chat.reply(
                     f"⚠️ 이미 출석했습니다.\n"
                     f"📅 총 출석: {user['total_checkin']}일\n"
@@ -361,12 +395,10 @@ def handle_user_commands(chat: ChatContext):
                 )
                 return True
 
-            # --- 출석하지 않은 경우 (신규 출석 로직) ---
             now = datetime.now(KST)
             today = now.date()
             yesterday_str = (today - timedelta(days=1)).isoformat()
 
-            # 연속 출석 계산
             if user['last_checkin_date'] == yesterday_str:
                 new_consecutive = user['consecutive_checkin'] + 1
             else:
@@ -401,12 +433,10 @@ def handle_user_commands(chat: ChatContext):
                 conn = get_db_conn()
                 cur = conn.cursor()
 
-                # 1. 최근 닉네임 변경 로그 가져오기
                 cur.execute("SELECT old_name, new_name FROM name_logs WHERE user_id = ? ORDER BY id DESC LIMIT 1",
                             (user['user_id'],))
                 last_log = cur.fetchone()
 
-                # 2. 보유 아이템(인벤토리) 정보 가져오기
                 cur.execute("""
                             SELECT i.item_name, inv.quantity 
                             FROM inventory inv 
@@ -414,21 +444,17 @@ def handle_user_commands(chat: ChatContext):
                             WHERE inv.user_id = ? AND inv.quantity > 0
                         """, (user['user_id'],))
                 my_items = cur.fetchall()
-
                 conn.close()
 
-            # 닉네임 로그 텍스트 구성
             log_text = ""
             if last_log:
                 log_text = f"\n•닉네임 변경: {last_log['old_name']}\n➜ {last_log['new_name']}"
 
-            # 인벤토리 텍스트 구성
             if not my_items:
                 inv_text = "보유 아이템이 없습니다."
             else:
                 inv_text = ", ".join([f"{item['item_name']}({item['quantity']})" for item in my_items])
 
-            # 전체 메시지 구성
             msg = [
                 f"🌱 {user['name']}",
                 "",
@@ -451,20 +477,15 @@ def handle_user_commands(chat: ChatContext):
             chat.reply("\n".join(msg))
             return True
 
-        # ─────────────────────────────
-        # 채팅 순위표 출력 (상위 10명)
-        # ─────────────────────────────
         if cmd == "/채팅순위":
             with DB_LOCK:
                 conn = get_db_conn()
                 cur = conn.cursor()
 
-                # 1. 전체 유저의 채팅 총합 계산 (점유율 계산용)
                 cur.execute("SELECT SUM(total_chat) FROM users")
                 total_sum_row = cur.fetchone()
                 total_sum = total_sum_row[0] if total_sum_row and total_sum_row[0] > 0 else 1
 
-                # 2. total_chat 기준 내림차순 정렬, 상위 15명 추출
                 cur.execute("""
                                 SELECT name, total_chat, job 
                                 FROM users 
@@ -479,18 +500,11 @@ def handle_user_commands(chat: ChatContext):
                 return True
 
             rank_msg = ["🏆 [ 전체 채팅 순위 TOP 15 ]", "────────"]
-
-            # 메달 이모지 리스트
             medals = ["🥇", "🥈", "🥉"] + ["✨"] * 12
 
             for i, row in enumerate(rows):
                 rank = i + 1
-                medal = medals[i]
-
-                # 점유율 계산 (개인 채팅 / 전체 채팅 * 100)
                 share = (row['total_chat'] / total_sum) * 100
-
-                # 출력 형식: 🥇 1위: 이름 [직업] (점유율%)
                 rank_msg.append(f"{rank}위: {row['name']}")
                 rank_msg.append(f"   ㄴ 누적 채팅: {row['total_chat']:,}회 ({share:.1f}%)")
 
@@ -513,7 +527,6 @@ def handle_user_commands(chat: ChatContext):
                 row = cur.fetchone()
 
                 if row:
-                    # ✅ 수정: 이미 보유한 번호를 보여주도록 변경
                     chat.reply(f"🎫 이미 추첨 대기 중인 복권이 있습니다.\n번호: [{row['numbers']}]\n(매일 오전 7시 당첨 결과를 공개!)")
                 else:
                     new_nums = f"{random.randint(0, 999):03d}"
@@ -532,7 +545,7 @@ def handle_user_commands(chat: ChatContext):
                 cur.execute("SELECT COUNT(*) as cnt FROM lotto WHERE is_drawn=0")
                 wait_cnt = cur.fetchone()['cnt']
                 conn.close()
-            # ✅ 수정: 확률 언급 제거
+
             chat.reply(
                 f"**복권 시스템 정보**\n\n"
                 f"1등 상금: 300P\n"
@@ -540,8 +553,6 @@ def handle_user_commands(chat: ChatContext):
                 f"현재 {wait_cnt}명이 참여 중입니다."
             )
             return True
-
-
 
         if cmd == "/상점":
             with DB_LOCK:
@@ -560,23 +571,19 @@ def handle_user_commands(chat: ChatContext):
             chat.reply("\n".join(shop_msg))
             return True
 
-            # 2. 아이템 구매
         if cmd == "/구매":
-            # iris 라이브러리의 param 속성은 명령어 뒤의 텍스트만 담고 있습니다.
             target_item = getattr(chat.message, "param", "").strip()
 
             if not target_item:
                 chat.reply("⚠️ 구매하실 아이템 이름을 입력해주세요.\n예: /구매 확성기")
                 return True
 
-            # target_item이 바로 "확성기"가 됩니다.
             now_time = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
             with DB_LOCK:
                 conn = get_db_conn()
                 cur = conn.cursor()
 
-                # 아이템 정보 확인
                 cur.execute("SELECT * FROM items WHERE item_name = ?", (target_item,))
                 item = cur.fetchone()
 
@@ -585,7 +592,6 @@ def handle_user_commands(chat: ChatContext):
                     conn.close()
                     return True
 
-                # 최신 포인트 정보 실시간 확인
                 cur.execute("SELECT points FROM users WHERE user_id = ?", (user['user_id'],))
                 current_points = cur.fetchone()['points']
 
@@ -594,7 +600,6 @@ def handle_user_commands(chat: ChatContext):
                     conn.close()
                     return True
 
-                # 결제 및 인벤토리 추가
                 try:
                     cur.execute("""
                                 UPDATE users 
@@ -623,20 +628,14 @@ def handle_user_commands(chat: ChatContext):
                     print(f"Purchase Error: {e}")
 
                 conn.close()
-
             return True
 
-        # ─────────────────────────────
-        # 관리자 전용: 상점 아이템 추가
-        # ─────────────────────────────
         if cmd == "/상점추가":
             if chat.sender.id not in ADMIN_LIST:
-                print("관리자가 아닙니다.",chat.sender.id)
                 return False
 
-                # 형식: /상점추가 [아이템명] [가격] [설명]
             param = getattr(chat.message, "param", "").strip()
-            parts = param.split(maxsplit=2)  # 이름, 가격, 설명으로 분리
+            parts = param.split(maxsplit=2)
 
             if len(parts) < 3:
                 chat.reply("⚠️ 형식: /상점추가 [이름] [가격] [설명]\n예: /상점추가 포션 500 체력을 회복합니다.")
@@ -668,14 +667,10 @@ def handle_user_commands(chat: ChatContext):
                     conn.close()
             return True
 
-        # ─────────────────────────────
-        # 관리자 전용: 상점 아이템 삭제
-        # ─────────────────────────────
         if cmd == "/상점삭제":
             if chat.sender.id not in ADMIN_LIST:
                 return False
 
-                # 형식: /상점삭제 [아이템명]
             item_name = getattr(chat.message, "param", "").strip()
 
             if not item_name:
@@ -686,7 +681,6 @@ def handle_user_commands(chat: ChatContext):
                 conn = get_db_conn()
                 cur = conn.cursor()
 
-                # 먼저 해당 아이템이 존재하는지 확인
                 cur.execute("SELECT item_id FROM items WHERE item_name = ?", (item_name,))
                 item = cur.fetchone()
 
@@ -694,12 +688,7 @@ def handle_user_commands(chat: ChatContext):
                     chat.reply(f"❓ '{item_name}'은(는) 상점에 등록되지 않은 아이템입니다.")
                 else:
                     try:
-                        # 1. 상점에서 삭제
                         cur.execute("DELETE FROM items WHERE item_name = ?", (item_name,))
-
-                        # 2. (선택사항) 인벤토리에서도 모두 회수하고 싶다면 아래 주석 해제
-                        # cur.execute("DELETE FROM inventory WHERE item_id = ?", (item['item_id'],))
-
                         conn.commit()
                         chat.reply(f"🗑️ 아이템 '{item_name}'이(가) 상점에서 영구 삭제되었습니다.")
                     except Exception as e:
@@ -707,11 +696,8 @@ def handle_user_commands(chat: ChatContext):
 
                 conn.close()
             return True
-        # ─────────────────────────────
-        # 관리자 전용: 전체 유저 포인트 및 아이템 정보 조회
-        # ─────────────────────────────
+
         if cmd == "/포인트정보":
-            # 관리자 권한 체크
             if chat.sender.id not in ADMIN_LIST:
                 return False
 
@@ -719,11 +705,9 @@ def handle_user_commands(chat: ChatContext):
                 conn = get_db_conn()
                 cur = conn.cursor()
 
-                # 1. 전체 유저 정보 가져오기 (포인트가 많은 순으로 정렬)
                 cur.execute("SELECT user_id, name, points FROM users ORDER BY points DESC")
                 all_users = cur.fetchall()
 
-                # 2. 전체 인벤토리 정보 가져오기
                 cur.execute("""
                             SELECT inv.user_id, i.item_name, inv.quantity 
                             FROM inventory inv 
@@ -737,7 +721,6 @@ def handle_user_commands(chat: ChatContext):
                 chat.reply("⚠️ 등록된 유저가 없습니다.")
                 return True
 
-            # 3. 인벤토리 데이터를 user_id를 키값으로 딕셔너리에 묶기
             user_items_map = {}
             for inv in all_inventory:
                 uid = inv['user_id']
@@ -745,25 +728,18 @@ def handle_user_commands(chat: ChatContext):
                     user_items_map[uid] = []
                 user_items_map[uid].append(f"{inv['item_name']}({inv['quantity']})")
 
-            # 4. 출력 메시지 구성
             info_msg = ["👑 [ 유저 포인트 & 아이템 현황 ]", "────────"]
 
             for u in all_users:
                 uid = u['user_id']
-                # 해당 유저의 아이템 리스트 가져오기 (없으면 '없음' 처리)
                 items_str = ", ".join(user_items_map.get(uid, ["없음"]))
-
                 info_msg.append(f"👤 {u['name']} (🅟{u['points']:,})")
                 info_msg.append(f"   ㄴ 📦 아이템: {items_str}")
 
             info_msg.append("────────")
-
-            # 메시지가 너무 길 경우를 대비해 전송 (카카오톡 등 플랫폼 제한 주의)
             chat.reply("\n".join(info_msg))
             return True
-        # ─────────────────────────────
-        # 관리자 전용: 유저 목록 조회 (번호 부여)
-        # ─────────────────────────────
+
         if cmd == "/유저목록":
             if chat.sender.id not in ADMIN_LIST:
                 return False
@@ -771,7 +747,6 @@ def handle_user_commands(chat: ChatContext):
             with DB_LOCK:
                 conn = get_db_conn()
                 cur = conn.cursor()
-                # 이름을 기준으로 오름차순 정렬
                 cur.execute("SELECT name, job, points FROM users ORDER BY name ASC")
                 users = cur.fetchall()
                 conn.close()
@@ -781,7 +756,6 @@ def handle_user_commands(chat: ChatContext):
                 return True
 
             msg_lines = ["📋 [ 전체 유저 목록 ]", "────────"]
-            # 1번부터 순서대로 번호 매기기
             for i, u in enumerate(users, start=1):
                 msg_lines.append(f"{i}. 👤 {u['name']} [{u['job']}] - 🅟{u['points']:,}")
 
@@ -793,7 +767,7 @@ def handle_user_commands(chat: ChatContext):
             return True
 
         # ─────────────────────────────
-        # 관리자 전용: 유저 삭제 (목록 번호 기준)
+        # 관리자 전용: 유저 삭제 (목록 번호 기준 + YES/NO 대기열 등록)
         # ─────────────────────────────
         if cmd == "/유저삭제":
             if chat.sender.id not in ADMIN_LIST:
@@ -801,7 +775,6 @@ def handle_user_commands(chat: ChatContext):
 
             param = getattr(chat.message, "param", "").strip()
 
-            # 입력값이 숫자인지 확인
             if not param.isdigit():
                 chat.reply("⚠️ 삭제할 유저의 '번호'를 입력해주세요.\n예: /유저삭제 3")
                 return True
@@ -811,39 +784,27 @@ def handle_user_commands(chat: ChatContext):
             with DB_LOCK:
                 conn = get_db_conn()
                 cur = conn.cursor()
-
-                # /유저목록과 동일하게 오름차순 정렬하여 데이터를 가져옴
                 cur.execute("SELECT user_id, name FROM users ORDER BY name ASC")
                 users = cur.fetchall()
+                conn.close()
 
-                # 입력한 번호가 실제 유저 수 범위 내에 있는지 검사
-                if target_idx < 1 or target_idx > len(users):
-                    chat.reply(f"⚠️ 잘못된 번호입니다. (1~{len(users)} 사이 입력)\n/유저목록 을 다시 확인해주세요.")
-                    conn.close()
-                    return True
+            if target_idx < 1 or target_idx > len(users):
+                chat.reply(f"⚠️ 잘못된 번호입니다. (1~{len(users)} 사이 입력)\n/유저목록 을 다시 확인해주세요.")
+                return True
 
-                # 리스트는 0부터 시작하므로 입력한 번호에서 -1을 해줌
-                target_user = users[target_idx - 1]
-                uid = target_user['user_id']
-                exact_name = target_user['name']
+            target_user = users[target_idx - 1]
 
-                # 2. 연관된 모든 테이블에서 데이터 일괄 삭제
-                try:
-                    cur.execute("DELETE FROM inventory WHERE user_id = ?", (uid,))
-                    cur.execute("DELETE FROM lotto WHERE user_id = ?", (uid,))
-                    cur.execute("DELETE FROM name_logs WHERE user_id = ?", (uid,))
-                    cur.execute("DELETE FROM users WHERE user_id = ?", (uid,))
-                    conn.commit()
+            # 대기열에 저장
+            pending_deletions[chat.sender.id] = {
+                "target_uid": target_user['user_id'],
+                "target_name": target_user['name']
+            }
 
-                    chat.reply(f"🗑️ [{target_idx}번] '{exact_name}' 유저의 모든 데이터가 영구 삭제되었습니다.")
-                except Exception as e:
-                    conn.rollback()
-                    chat.reply(f"❌ 유저 삭제 중 오류 발생: {e}")
-                finally:
-                    conn.close()
-
+            chat.reply(
+                f"⚠️ 정말로 [{target_idx}번] '{target_user['name']}' 유저의 모든 데이터를 삭제하시겠습니까?\n\n"
+                f"동의하시면 대문자로 YES를, 취소하시려면 NO를 입력해주세요."
+            )
             return True
-
 
     except Exception as e:
         print(f"Error: {e}")
