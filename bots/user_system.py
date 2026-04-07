@@ -347,21 +347,28 @@ def execute_probability_draw(bot):
 def handle_user_commands(chat: ChatContext):
     try:
         admin_id = chat.sender.id
-        msg_text = getattr(chat.message, "text", "").strip()
         cmd = getattr(chat.message, "command", "")
 
         # ─────────────────────────────
-        # 관리자 전용: 삭제 최종 확인 (YES / NO)
+        # 관리자 전용: 삭제 최종 확인 (/유저삭제동의 YES 또는 NO)
         # ─────────────────────────────
-        if admin_id in pending_deletions and msg_text in ["YES", "NO"]:
-            # 대기열에서 정보 꺼내기
-            target_info = pending_deletions.pop(admin_id)
+        if cmd == "/유저삭제동의":
+            if admin_id not in ADMIN_LIST:
+                return False
 
-            if msg_text == "NO":
+            param = getattr(chat.message, "param", "").strip().upper()
+
+            if admin_id not in pending_deletions:
+                chat.reply("⚠️ 현재 삭제 대기 중인 유저가 없습니다.")
+                return True
+
+            if param == "NO":
+                pending_deletions.pop(admin_id)  # 대기열에서 제거
                 chat.reply("❌ 유저 삭제가 취소되었습니다.")
                 return True
 
-            if msg_text == "YES":
+            elif param == "YES":
+                target_info = pending_deletions.pop(admin_id)
                 uid = target_info['target_uid']
                 exact_name = target_info['target_name']
 
@@ -380,6 +387,9 @@ def handle_user_commands(chat: ChatContext):
                         chat.reply(f"❌ 유저 삭제 중 오류 발생: {e}")
                     finally:
                         conn.close()
+                return True
+            else:
+                chat.reply("⚠️ 올바른 형식이 아닙니다.\n예시: /유저삭제동의 YES 또는 /유저삭제동의 NO")
                 return True
 
         user = _get_or_create_user(chat)
@@ -802,11 +812,10 @@ def handle_user_commands(chat: ChatContext):
 
             chat.reply(
                 f"⚠️ 정말로 [{target_idx}번] '{target_user['name']}' 유저의 모든 데이터를 삭제하시겠습니까?\n\n"
-                f"동의하시면 대문자로 YES를, 취소하시려면 NO를 입력해주세요."
+                f"동의하시면 `/유저삭제동의 YES` 를, 취소하시려면 `/유저삭제동의 NO` 를 입력해주세요."
             )
             return True
 
     except Exception as e:
         print(f"Error: {e}")
     return False
-
