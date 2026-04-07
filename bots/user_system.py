@@ -762,7 +762,7 @@ def handle_user_commands(chat: ChatContext):
             chat.reply("\n".join(info_msg))
             return True
         # ─────────────────────────────
-        # 관리자 전용: 유저 목록 조회
+        # 관리자 전용: 유저 목록 조회 (번호 부여)
         # ─────────────────────────────
         if cmd == "/유저목록":
             if chat.sender.id not in ADMIN_LIST:
@@ -771,7 +771,7 @@ def handle_user_commands(chat: ChatContext):
             with DB_LOCK:
                 conn = get_db_conn()
                 cur = conn.cursor()
-                # 유저 이름순으로 정렬하여 보기 편하게 출력
+                # 이름을 기준으로 오름차순 정렬
                 cur.execute("SELECT name, job, points FROM users ORDER BY name ASC")
                 users = cur.fetchall()
                 conn.close()
@@ -781,43 +781,53 @@ def handle_user_commands(chat: ChatContext):
                 return True
 
             msg_lines = ["📋 [ 전체 유저 목록 ]", "────────"]
-            for u in users:
-                msg_lines.append(f"👤 {u['name']} [{u['job']}] - 🅟{u['points']:,}")
+            # 1번부터 순서대로 번호 매기기
+            for i, u in enumerate(users, start=1):
+                msg_lines.append(f"{i}. 👤 {u['name']} [{u['job']}] - 🅟{u['points']:,}")
+
             msg_lines.append("────────")
-            msg_lines.append("💡 삭제 방법: /유저삭제 [유저명]")
+            msg_lines.append("💡 삭제 방법: /유저삭제 [번호]")
+            msg_lines.append("예시: /유저삭제 3")
 
             chat.reply("\n".join(msg_lines))
             return True
 
         # ─────────────────────────────
-        # 관리자 전용: 유저 삭제 (DB 데이터 일괄 삭제)
+        # 관리자 전용: 유저 삭제 (목록 번호 기준)
         # ─────────────────────────────
         if cmd == "/유저삭제":
             if chat.sender.id not in ADMIN_LIST:
                 return False
 
-            target_name = getattr(chat.message, "param", "").strip()
+            param = getattr(chat.message, "param", "").strip()
 
-            if not target_name:
-                chat.reply("⚠️ 삭제할 유저명을 입력해주세요.\n예: /유저삭제 홍길동")
+            # 입력값이 숫자인지 확인
+            if not param.isdigit():
+                chat.reply("⚠️ 삭제할 유저의 '번호'를 입력해주세요.\n예: /유저삭제 3")
                 return True
+
+            target_idx = int(param)
 
             with DB_LOCK:
                 conn = get_db_conn()
                 cur = conn.cursor()
 
-                # 1. 대상 유저 존재 여부 확인
-                cur.execute("SELECT user_id FROM users WHERE name = ?", (target_name,))
-                target_user = cur.fetchone()
+                # /유저목록과 동일하게 오름차순 정렬하여 데이터를 가져옴
+                cur.execute("SELECT user_id, name FROM users ORDER BY name ASC")
+                users = cur.fetchall()
 
-                if not target_user:
-                    chat.reply(f"❓ '{target_name}' 유저를 찾을 수 없습니다.")
+                # 입력한 번호가 실제 유저 수 범위 내에 있는지 검사
+                if target_idx < 1 or target_idx > len(users):
+                    chat.reply(f"⚠️ 잘못된 번호입니다. (1~{len(users)} 사이 입력)\n/유저목록 을 다시 확인해주세요.")
                     conn.close()
                     return True
 
+                # 리스트는 0부터 시작하므로 입력한 번호에서 -1을 해줌
+                target_user = users[target_idx - 1]
                 uid = target_user['user_id']
+                exact_name = target_user['name']
 
-                # 2. 연관된 모든 테이블에서 데이터 일괄 삭제 (트랜잭션 처리)
+                # 2. 연관된 모든 테이블에서 데이터 일괄 삭제
                 try:
                     cur.execute("DELETE FROM inventory WHERE user_id = ?", (uid,))
                     cur.execute("DELETE FROM lotto WHERE user_id = ?", (uid,))
@@ -825,7 +835,7 @@ def handle_user_commands(chat: ChatContext):
                     cur.execute("DELETE FROM users WHERE user_id = ?", (uid,))
                     conn.commit()
 
-                    chat.reply(f"🗑️ '{target_name}' 유저와 관련된 모든 데이터가 영구 삭제되었습니다.")
+                    chat.reply(f"🗑️ [{target_idx}번] '{exact_name}' 유저의 모든 데이터가 영구 삭제되었습니다.")
                 except Exception as e:
                     conn.rollback()
                     chat.reply(f"❌ 유저 삭제 중 오류 발생: {e}")
