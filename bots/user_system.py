@@ -10,10 +10,32 @@ import os
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
-# 환경변수에서 ADMIN_IDS를 가져와 리스트로 변환
-admin_raw = os.getenv("ADMIN_IDS", "")
-# 공백 제거 후 정수형(int) 리스트로 생성
-ADMIN_LIST = [int(aid.strip()) for aid in admin_raw.split(",") if aid.strip()]
+# ─────────────────────────────
+# 관리자 설정
+# 초기 관리자는 .env의 ADMIN_IDS에 강제 등록
+# 이후 관리자는 /관리자추가 명령어로 DB에 저장
+# ─────────────────────────────
+
+def load_env_admin_ids():
+    """
+    .env의 ADMIN_IDS 값을 읽어서 관리자 ID 리스트로 변환합니다.
+    예: ADMIN_IDS=12345,67890
+    """
+    admin_raw = os.getenv("ADMIN_IDS", "")
+    admin_ids = []
+
+    for aid in admin_raw.split(","):
+        aid = aid.strip()
+        if not aid:
+            continue
+
+        try:
+            admin_ids.append(int(aid))
+        except ValueError:
+            print(f"[관리자 설정 오류] ADMIN_IDS에 숫자가 아닌 값이 있습니다: {aid}")
+
+    return admin_ids
+
 # ─────────────────────────────
 # 설정 및 DB 연결
 # ─────────────────────────────
@@ -92,16 +114,154 @@ def init_db():
                     )
                 """)
 
+        # ✅ 관리자 테이블
+        # .env에 들어있는 초기 관리자와 명령어로 추가한 관리자를 모두 저장합니다.
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS admins (
+                        admin_id INTEGER PRIMARY KEY,
+                        added_by INTEGER,
+                        added_date TEXT,
+                        memo TEXT
+                    )
+                """)
+
 
         cur.execute("PRAGMA table_info(lotto)")
         if 'room_id' not in [c[1] for c in cur.fetchall()]:
             cur.execute("ALTER TABLE lotto ADD COLUMN room_id TEXT")
+
+        # ✅ .env 초기 관리자 DB 동기화
+        # 최초 관리자는 .env에 ADMIN_IDS=123,456 형태로 강제 등록합니다.
+        # 봇 재시작 시 .env 관리자가 DB admins 테이블에 자동 반영됩니다.
+        env_admin_ids = load_env_admin_ids()
+        now_time = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+        for env_admin_id in env_admin_ids:
+            cur.execute("""
+                        INSERT OR IGNORE INTO admins (admin_id, added_by, added_date, memo)
+                        VALUES (?, ?, ?, ?)
+                    """, (env_admin_id, 0, now_time, "ENV_INITIAL_ADMIN"))
 
         conn.commit()
         conn.close()
 
 
 init_db()
+
+
+# ─────────────────────────────
+# 관리자 유틸리티
+# ─────────────────────────────
+
+def is_admin(user_id):
+    """
+    관리자 여부 확인.
+    .env 관리자 + DB admins 테이블 관리자 모두 허용합니다.
+    """
+    try:
+        user_id = int(user_id)
+    except Exception:
+        return False
+
+    # 1차: .env 관리자 확인
+    if user_id in load_env_admin_ids():
+        return True
+
+    # 2차: DB 관리자 확인
+    with DB_LOCK:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT admin_id FROM admins WHERE admin_id = ?", (user_id,))
+        row = cur.fetchone()
+        conn.close()
+
+    return row is not None
+
+
+def add_admin(admin_id, added_by, memo="COMMAND_ADDED"):
+    """
+    관리자 추가.
+    반환값: (성공 여부, 메시지)
+    """
+    try:
+        admin_id = int(admin_id)
+        added_by = int(added_by)
+    except ValueError:
+        return False, "관리자 ID는 숫자여야 합니다."
+
+    now_time = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+    with DB_LOCK:
+        conn = get_db_conn()
+        cur = conn.cursor()
+
+        cur.execute("SELECT admin_id FROM admins WHERE admin_id = ?", (admin_id,))
+        exists = cur.fetchone()
+
+        if exists:
+            conn.close()
+            return False, "이미 등록된 관리자입니다."
+
+        cur.execute("""
+                    INSERT INTO admins (admin_id, added_by, added_date, memo)
+                    VALUES (?, ?, ?, ?)
+                """, (admin_id, added_by, now_time, memo))
+
+        conn.commit()
+        conn.close()
+
+    return True, "관리자로 추가되었습니다."
+
+
+def get_admin_list():
+    """
+    관리자 목록 조회.
+    """
+    with DB_LOCK:
+        conn = get_db_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+                    SELECT admin_id, added_by, added_date, memo
+                    FROM admins
+                    ORDER BY added_date ASC
+                """)
+        rows = cur.fetchall()
+        conn.close()
+
+    return rows
+
+
+def remove_admin(admin_id):
+    """
+    관리자 삭제.
+    단, .env에 들어있는 초기 관리자는 DB에서 삭제해도 다시 동기화될 수 있으므로 삭제를 막습니다.
+    반환값: (성공 여부, 메시지)
+    """
+    try:
+        admin_id = int(admin_id)
+    except ValueError:
+        return False, "관리자 ID는 숫자여야 합니다."
+
+    if admin_id in load_env_admin_ids():
+        return False, ".env에 등록된 초기 관리자는 명령어로 삭제할 수 없습니다."
+
+    with DB_LOCK:
+        conn = get_db_conn()
+        cur = conn.cursor()
+
+        cur.execute("SELECT admin_id FROM admins WHERE admin_id = ?", (admin_id,))
+        exists = cur.fetchone()
+
+        if not exists:
+            conn.close()
+            return False, "등록되지 않은 관리자입니다."
+
+        cur.execute("DELETE FROM admins WHERE admin_id = ?", (admin_id,))
+        conn.commit()
+        conn.close()
+
+    return True, "관리자에서 삭제되었습니다."
 
 
 # ─────────────────────────────
@@ -350,10 +510,138 @@ def handle_user_commands(chat: ChatContext):
         cmd = getattr(chat.message, "command", "")
 
         # ─────────────────────────────
+        # 관리자 ID 확인
+        # 최초 .env에 본인 ID를 넣기 전에 내 ID를 확인해야 하는 경우도 있어서
+        # 이 명령어는 비관리자도 자기 ID만 확인 가능하게 열어둡니다.
+        # ─────────────────────────────
+        if cmd == "/관리자ID":
+            admin_status = "관리자" if is_admin(chat.sender.id) else "일반유저"
+
+            chat.reply(
+                f"🆔 내 ID 확인\n"
+                f"────────\n"
+                f"• 내 ID: {chat.sender.id}\n"
+                f"• 닉네임: {chat.sender.name}\n"
+                f"• 권한: {admin_status}\n"
+                f"────────\n"
+                f"💡 최초 관리자는 .env에 ADMIN_IDS={chat.sender.id} 형태로 추가 후 봇을 재시작하세요."
+            )
+            return True
+
+        # ─────────────────────────────
+        # 관리자 전용: 관리자 추가
+        # 사용법: /관리자추가 123456789
+        # ─────────────────────────────
+        if cmd == "/관리자추가":
+            if not is_admin(chat.sender.id):
+                return False
+
+            param = getattr(chat.message, "param", "").strip()
+
+            if not param:
+                chat.reply(
+                    "⚠️ 추가할 관리자 ID를 입력해주세요.\n"
+                    "예: /관리자추가 123456789"
+                )
+                return True
+
+            if not param.isdigit():
+                chat.reply("⚠️ 관리자 ID는 숫자로 입력해주세요.")
+                return True
+
+            target_admin_id = int(param)
+
+            success, message = add_admin(
+                admin_id=target_admin_id,
+                added_by=chat.sender.id,
+                memo="COMMAND_ADDED"
+            )
+
+            if success:
+                chat.reply(
+                    f"✅ 관리자 추가 완료\n"
+                    f"────────\n"
+                    f"• 추가된 관리자 ID: {target_admin_id}\n"
+                    f"• 추가한 관리자 ID: {chat.sender.id}"
+                )
+            else:
+                chat.reply(f"⚠️ 관리자 추가 실패\n{message}")
+
+            return True
+
+        # ─────────────────────────────
+        # 관리자 전용: 관리자 삭제
+        # 사용법: /관리자삭제 123456789
+        # .env 초기 관리자는 삭제 불가
+        # ─────────────────────────────
+        if cmd == "/관리자삭제":
+            if not is_admin(chat.sender.id):
+                return False
+
+            param = getattr(chat.message, "param", "").strip()
+
+            if not param:
+                chat.reply(
+                    "⚠️ 삭제할 관리자 ID를 입력해주세요.\n"
+                    "예: /관리자삭제 123456789"
+                )
+                return True
+
+            if not param.isdigit():
+                chat.reply("⚠️ 관리자 ID는 숫자로 입력해주세요.")
+                return True
+
+            target_admin_id = int(param)
+
+            if target_admin_id == chat.sender.id:
+                chat.reply("⚠️ 자기 자신은 관리자에서 삭제할 수 없습니다.")
+                return True
+
+            success, message = remove_admin(target_admin_id)
+
+            if success:
+                chat.reply(
+                    f"🗑️ 관리자 삭제 완료\n"
+                    f"────────\n"
+                    f"• 삭제된 관리자 ID: {target_admin_id}"
+                )
+            else:
+                chat.reply(f"⚠️ 관리자 삭제 실패\n{message}")
+
+            return True
+
+        # ─────────────────────────────
+        # 관리자 전용: 관리자 목록
+        # ─────────────────────────────
+        if cmd == "/관리자목록":
+            if not is_admin(chat.sender.id):
+                return False
+
+            admins = get_admin_list()
+
+            if not admins:
+                chat.reply("⚠️ 등록된 관리자가 없습니다.")
+                return True
+
+            msg = ["👑 [ 관리자 목록 ]", "────────"]
+
+            for i, admin in enumerate(admins, start=1):
+                msg.append(f"{i}. ID: {admin['admin_id']}")
+                msg.append(f"   ㄴ 추가자: {admin['added_by']}")
+                msg.append(f"   ㄴ 등록일: {admin['added_date']}")
+                msg.append(f"   ㄴ 구분: {admin['memo']}")
+
+            msg.append("────────")
+            msg.append("💡 추가: /관리자추가 [유저ID]")
+            msg.append("💡 삭제: /관리자삭제 [유저ID]")
+            chat.reply("\n".join(msg))
+            return True
+
+        # ─────────────────────────────
         # 관리자 전용: 삭제 최종 확인 (/유저삭제동의 YES 또는 NO)
         # ─────────────────────────────
         if cmd == "/유저삭제동의":
-            if admin_id not in ADMIN_LIST:
+            if not is_admin(admin_id):
                 return False
 
             param = getattr(chat.message, "param", "").strip().upper()
@@ -641,7 +929,7 @@ def handle_user_commands(chat: ChatContext):
             return True
 
         if cmd == "/상점추가":
-            if chat.sender.id not in ADMIN_LIST:
+            if not is_admin(chat.sender.id):
                 return False
 
             param = getattr(chat.message, "param", "").strip()
@@ -678,7 +966,7 @@ def handle_user_commands(chat: ChatContext):
             return True
 
         if cmd == "/상점삭제":
-            if chat.sender.id not in ADMIN_LIST:
+            if not is_admin(chat.sender.id):
                 return False
 
             item_name = getattr(chat.message, "param", "").strip()
@@ -708,7 +996,7 @@ def handle_user_commands(chat: ChatContext):
             return True
 
         if cmd == "/포인트정보":
-            if chat.sender.id not in ADMIN_LIST:
+            if not is_admin(chat.sender.id):
                 return False
 
             with DB_LOCK:
@@ -751,7 +1039,7 @@ def handle_user_commands(chat: ChatContext):
             return True
 
         if cmd == "/유저목록":
-            if chat.sender.id not in ADMIN_LIST:
+            if not is_admin(chat.sender.id):
                 return False
 
             with DB_LOCK:
@@ -780,7 +1068,7 @@ def handle_user_commands(chat: ChatContext):
         # 관리자 전용: 유저 삭제 (목록 번호 기준 + YES/NO 대기열 등록)
         # ─────────────────────────────
         if cmd == "/유저삭제":
-            if chat.sender.id not in ADMIN_LIST:
+            if not is_admin(chat.sender.id):
                 return False
 
             param = getattr(chat.message, "param", "").strip()
