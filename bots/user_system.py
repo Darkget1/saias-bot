@@ -268,6 +268,8 @@ def remove_admin(admin_id):
 # 유틸리티
 # ─────────────────────────────
 
+TAGGED_USER_SQL_CONDITION = "name LIKE '%[%' AND name LIKE '%]%'"
+
 
 def _get_or_create_user(chat: ChatContext):
     uid = chat.sender.id
@@ -780,13 +782,14 @@ def handle_user_commands(chat: ChatContext):
                 conn = get_db_conn()
                 cur = conn.cursor()
 
-                cur.execute("SELECT SUM(total_chat) FROM users")
+                cur.execute(f"SELECT SUM(total_chat) FROM users WHERE {TAGGED_USER_SQL_CONDITION}")
                 total_sum_row = cur.fetchone()
                 total_sum = total_sum_row[0] if total_sum_row and total_sum_row[0] > 0 else 1
 
-                cur.execute("""
+                cur.execute(f"""
                                 SELECT name, total_chat, job 
                                 FROM users 
+                                WHERE {TAGGED_USER_SQL_CONDITION}
                                 ORDER BY total_chat DESC 
                                 LIMIT 15
                             """)
@@ -797,7 +800,7 @@ def handle_user_commands(chat: ChatContext):
                 chat.reply("데이터가 충분하지 않습니다.")
                 return True
 
-            rank_msg = ["🏆 [ 전체 채팅 순위 TOP 15 ]", "────────"]
+            rank_msg = ["🏆 [ 유저 채팅 순위 TOP 15 ]", "────────"]
             medals = ["🥇", "🥈", "🥉"] + ["✨"] * 12
 
             for i, row in enumerate(rows):
@@ -1003,7 +1006,12 @@ def handle_user_commands(chat: ChatContext):
                 conn = get_db_conn()
                 cur = conn.cursor()
 
-                cur.execute("SELECT user_id, name, points FROM users ORDER BY points DESC")
+                cur.execute(f"""
+                            SELECT user_id, name, points
+                            FROM users
+                            WHERE {TAGGED_USER_SQL_CONDITION}
+                            ORDER BY points DESC
+                        """)
                 all_users = cur.fetchall()
 
                 cur.execute("""
@@ -1045,7 +1053,12 @@ def handle_user_commands(chat: ChatContext):
             with DB_LOCK:
                 conn = get_db_conn()
                 cur = conn.cursor()
-                cur.execute("SELECT name, job, points FROM users ORDER BY name ASC")
+                cur.execute(f"""
+                            SELECT name, job, points
+                            FROM users
+                            WHERE {TAGGED_USER_SQL_CONDITION}
+                            ORDER BY name ASC
+                        """)
                 users = cur.fetchall()
                 conn.close()
 
@@ -1082,7 +1095,12 @@ def handle_user_commands(chat: ChatContext):
             with DB_LOCK:
                 conn = get_db_conn()
                 cur = conn.cursor()
-                cur.execute("SELECT user_id, name FROM users ORDER BY name ASC")
+                cur.execute(f"""
+                            SELECT user_id, name
+                            FROM users
+                            WHERE {TAGGED_USER_SQL_CONDITION}
+                            ORDER BY name ASC
+                        """)
                 users = cur.fetchall()
                 conn.close()
 
