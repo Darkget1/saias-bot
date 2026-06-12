@@ -270,6 +270,60 @@ def remove_admin(admin_id):
 
 TAGGED_USER_SQL_CONDITION = "name LIKE '%[%' AND name LIKE '%]%'"
 
+LOTTO_MIN_NUMBER = 111
+LOTTO_MAX_NUMBER = 333
+LOTTO_FIRST_PRIZE = 300
+LOTTO_SECOND_PRIZE = 150
+USE_LEGACY_PROBABILITY_LOTTO_DRAW = False
+
+
+def _format_lotto_number(number):
+    return f"{int(number):03d}"
+
+
+def _generate_lotto_number():
+    return _format_lotto_number(random.randint(LOTTO_MIN_NUMBER, LOTTO_MAX_NUMBER))
+
+
+def _is_valid_lotto_number(number):
+    try:
+        lotto_number = int(str(number).strip())
+    except (TypeError, ValueError):
+        return False
+
+    return LOTTO_MIN_NUMBER <= lotto_number <= LOTTO_MAX_NUMBER
+
+
+def _count_lotto_digit_matches(user_number, winning_number):
+    user_number = _format_lotto_number(user_number)
+    winning_number = _format_lotto_number(winning_number)
+    return sum(1 for i in range(3) if user_number[i] == winning_number[i])
+
+
+def _pick_legacy_probability_lotto_number(tickets):
+    """기존 확률식 산출 로직. 재활용 가능성을 위해 보관하고 기본값에서는 사용하지 않습니다."""
+    taken_numbers = {str(t['numbers']).strip() for t in tickets if _is_valid_lotto_number(t['numbers'])}
+
+    for t in tickets:
+        if not _is_valid_lotto_number(t['numbers']):
+            continue
+        if random.randint(1, 100) == 1:
+            return _format_lotto_number(t['numbers'])
+
+    for _ in range(1000):
+        temp_num = _generate_lotto_number()
+        if temp_num not in taken_numbers:
+            return temp_num
+
+    return _generate_lotto_number()
+
+
+def _pick_lotto_winning_number(tickets):
+    if USE_LEGACY_PROBABILITY_LOTTO_DRAW:
+        return _pick_legacy_probability_lotto_number(tickets)
+
+    return _generate_lotto_number()
+
 
 def _get_or_create_user(chat: ChatContext):
     uid = chat.sender.id
@@ -369,7 +423,7 @@ def safe_send_message(bot, room_id, text):
 
 
 # ─────────────────────────────
-# 스케줄러 & 확률 추첨 (확률 비공개)
+# 스케줄러 & 복권 추첨
 # ─────────────────────────────
 
 def start_lotto_scheduler(bot):
@@ -390,15 +444,13 @@ def start_lotto_scheduler(bot):
 
             time.sleep(wait_sec)
 
-            execute_probability_draw(bot)
+            execute_lotto_draw(bot)
             time.sleep(5)
 
     threading.Thread(target=run, daemon=True).start()
 
 
-def execute_probability_draw(bot):
-    today_str = datetime.now(KST).date().isoformat()
-
+def execute_lotto_draw(bot):
     with DB_LOCK:
         conn = get_db_conn()
         cur = conn.cursor()
@@ -423,44 +475,27 @@ def execute_probability_draw(bot):
             """, (rid,))
 
             tickets = cur.fetchall()
-            taken_numbers = set([t['numbers'] for t in tickets])
-            winning_number = None
-
-            # 1. 1등 당첨자 선정 (1% 확률)
-            for t in tickets:
-                if random.randint(1, 100) == 1:
-                    winning_number = t['numbers']
-                    break
-
-            # 2. 당첨자가 없을 경우 중복되지 않는 꽝 번호 생성
-            if winning_number is None:
-                for _ in range(1000):
-                    temp_num = f"{random.randint(0, 999):03d}"
-                    if temp_num not in taken_numbers:
-                        winning_number = temp_num
-                        break
-                if winning_number is None:
-                    winning_number = f"{random.randint(0, 999):03d}"
+            winning_number = _pick_lotto_winning_number(tickets)
 
             # 3. 채점 및 포인트 지급
             w1_list = []
             w2_list = []
+            invalid_ticket_count = 0
 
             for t in tickets:
                 u_num = t['numbers']
-                match_cnt = 0
-                for i in range(3):
-                    if u_num[i] == winning_number[i]:
-                        match_cnt += 1
+                if not _is_valid_lotto_number(u_num):
+                    invalid_ticket_count += 1
+                    continue
+
+                match_cnt = _count_lotto_digit_matches(u_num, winning_number)
 
                 if match_cnt == 3:
-                    # 1등 (300P)
                     w1_list.append(t['name'])
-                    cur.execute("UPDATE users SET points=points+300 WHERE user_id=?", (t['user_id'],))
+                    cur.execute("UPDATE users SET points=points+? WHERE user_id=?", (LOTTO_FIRST_PRIZE, t['user_id']))
                 elif match_cnt == 2:
-                    # 2등 (150P로 수정)
                     w2_list.append(t['name'])
-                    cur.execute("UPDATE users SET points=points+150 WHERE user_id=?", (t['user_id'],))
+                    cur.execute("UPDATE users SET points=points+? WHERE user_id=?", (LOTTO_SECOND_PRIZE, t['user_id']))
 
             # 4. 결과 메시지 구성 (요청하신 형식)
             msg_lines = [
@@ -485,12 +520,16 @@ def execute_probability_draw(bot):
 
                 msg_lines.append("")
                 msg_lines.append("축하합니다!")
-                msg_lines.append("1등 당첨자 : 🅟300")
-                msg_lines.append("2등 당첨자 : 🅟150")
+                msg_lines.append(f"1등 당첨자 : 🅟{LOTTO_FIRST_PRIZE}")
+                msg_lines.append(f"2등 당첨자 : 🅟{LOTTO_SECOND_PRIZE}")
             else:
                 msg_lines.append(f"행운의 복권 {len(tickets)}명 추첨 결과")
                 msg_lines.append("────────")
                 msg_lines.append("'푸헤헤헤. 다음 기회에' 로 ")
+
+            if invalid_ticket_count:
+                msg_lines.append("")
+                msg_lines.append(f"범위 밖 복권 {invalid_ticket_count}건은 자동 탈락 처리되었습니다.")
 
             # 최종 메시지 전송
             safe_send_message(bot, rid, "\n".join(msg_lines))
@@ -499,6 +538,9 @@ def execute_probability_draw(bot):
         cur.execute("UPDATE lotto SET is_drawn=1 WHERE is_drawn=0")
         conn.commit()
         conn.close()
+
+
+execute_probability_draw = execute_lotto_draw
 
 
 
@@ -830,7 +872,7 @@ def handle_user_commands(chat: ChatContext):
                 if row:
                     chat.reply(f"🎫 이미 추첨 대기 중인 복권이 있습니다.\n번호: [{row['numbers']}]\n(매일 오전 7시 당첨 결과를 공개!)")
                 else:
-                    new_nums = f"{random.randint(0, 999):03d}"
+                    new_nums = _generate_lotto_number()
                     cur.execute(
                         "INSERT INTO lotto (user_id, lotto_date, numbers, room_id, is_drawn) VALUES (?, ?, ?, ?, 0)",
                         (user['user_id'], today, new_nums, room_id))
@@ -849,8 +891,9 @@ def handle_user_commands(chat: ChatContext):
 
             chat.reply(
                 f"**복권 시스템 정보**\n\n"
-                f"1등 상금: 300P\n"
-                f"2등 상금: 150P\n\n"
+                f"번호 범위: {LOTTO_MIN_NUMBER}~{LOTTO_MAX_NUMBER}\n"
+                f"1등 상금: {LOTTO_FIRST_PRIZE}P\n"
+                f"2등 상금: {LOTTO_SECOND_PRIZE}P\n\n"
                 f"현재 {wait_cnt}명이 참여 중입니다."
             )
             return True
