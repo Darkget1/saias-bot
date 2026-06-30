@@ -1,19 +1,34 @@
+import base64
+import hashlib
 import json
 import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib import request as urlrequest
 
 
-DEEP_HOLE_API_URL = "https://mabimobi.life/d/api/v1/deep-hole-config"
+DEEP_HOLE_API_URL = "https://mabimobi.life/d/api/v1/adh"
+DEEP_HOLE_CONFIG_API_URL = "https://mabimobi.life/d/api/v1/deep-hole-config"
 DEEP_HOLE_TARGET_SERVER = os.getenv("DEEP_HOLE_TARGET_SERVER", "던컨")
 DEEP_HOLE_TARGET_AREA = os.getenv("DEEP_HOLE_TARGET_AREA", "창백한 산")
 DEEP_HOLE_CHECK_INTERVAL_SECONDS = 30 * 60
 DEEP_HOLE_DRIFT_THRESHOLD_SECONDS = 60
 DEEP_HOLE_REQUEST_TIMEOUT_SECONDS = 10
 DEEP_HOLE_TRACKER_ENABLED = os.getenv("DEEP_HOLE_TRACKER_ENABLED", "1").strip() != "0"
+DEEP_HOLE_APPEARANCE_SECONDS = 30 * 60
+DEEP_HOLE_DH_KEY = "8nvov88uc5k4o4g6apax04783thjo11l"
+DEEP_HOLE_SERVER_CODES = {
+    "데이안": "01",
+    "아이라": "02",
+    "던컨": "03",
+    "알리사": "04",
+    "메이븐": "05",
+    "라사": "06",
+    "칼릭스": "07",
+    "몰리": "08",
+}
 _TRACKER_LOCK = threading.Lock()
 _TRACKER_STARTED = False
 
@@ -156,6 +171,202 @@ def _extract_deep_hole_open_status(data):
     return None
 
 
+def _decode_interleaved_payload(payload):
+    max_header_len = min(16, len(payload))
+    for header_len in range(8, max_header_len + 1):
+        for split_at in range(4, header_len - 3):
+            even_text = payload[:split_at]
+            odd_text = payload[split_at:header_len]
+            if not (even_text.isdigit() and odd_text.isdigit()):
+                continue
+
+            even_count = int(even_text)
+            odd_count = int(odd_text)
+            expected_header = f"{even_count:04d}{odd_count:04d}"
+            if expected_header != payload[:header_len]:
+                continue
+            if len(payload) - header_len != (even_count + odd_count) * 4:
+                continue
+
+            body = payload[header_len:]
+            even_chunks = [body[i:i + 4] for i in range(0, even_count * 4, 4)]
+            odd_body = body[even_count * 4:]
+            odd_chunks = [odd_body[i:i + 4] for i in range(0, odd_count * 4, 4)]
+
+            chunks = []
+            even_index = 0
+            odd_index = 0
+            for index in range(even_count + odd_count):
+                if index % 2 == 0 and even_index < len(even_chunks):
+                    chunks.append(even_chunks[even_index])
+                    even_index += 1
+                elif odd_index < len(odd_chunks):
+                    chunks.append(odd_chunks[odd_index])
+                    odd_index += 1
+
+            encoded = "".join(chunks)
+            encoded += "=" * (-len(encoded) % 4)
+            return base64.b64decode(encoded)
+
+    raise ValueError("Invalid deep-hole payload header")
+
+
+def _deep_hole_seed_text(dt, use_utc):
+    if use_utc:
+        dt = dt.astimezone(timezone.utc)
+    return f"{dt.year}{dt.month}{dt.day}{dt.hour}"
+
+
+def _deep_hole_time_seeds(kst):
+    now_utc = datetime.now(timezone.utc)
+    now_kst = datetime.now(kst)
+    seeds = []
+
+    for hour_offset in (0, -1, 1):
+        shifted_utc = now_utc + timedelta(hours=hour_offset)
+        shifted_kst = now_kst + timedelta(hours=hour_offset)
+        seeds.append(_deep_hole_seed_text(shifted_utc, True))
+        seeds.append(_deep_hole_seed_text(shifted_kst, False))
+
+    return list(dict.fromkeys(seeds))
+
+
+def _deobfuscate_deep_hole_payload(payload, kst):
+    decoded_bytes = _decode_interleaved_payload(payload)
+    last_error = None
+
+    for seed in _deep_hole_time_seeds(kst):
+        key = hashlib.sha256(f"{DEEP_HOLE_DH_KEY}:{seed}".encode("utf-8")).digest()
+        output = bytes(value ^ key[index % len(key)] for index, value in enumerate(decoded_bytes))
+        try:
+            return json.loads(output.decode("utf-8"))
+        except Exception as exc:
+            last_error = exc
+
+    raise ValueError(f"Failed to decode deep-hole payload: {last_error}")
+
+
+def _parse_deep_hole_reports(data, kst):
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        payload = data.get("payload")
+        if isinstance(payload, str):
+            decoded = _deobfuscate_deep_hole_payload(payload, kst)
+            return decoded if isinstance(decoded, list) else []
+        for key in ("reports", "items", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def _parse_datetime(value, kst):
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = value / 1000 if value > 10_000_000_000 else value
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(kst)
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = kst.localize(parsed) if hasattr(kst, "localize") else parsed.replace(tzinfo=kst)
+    return parsed.astimezone(kst)
+
+
+def _server_code(value):
+    text = str(value).strip()
+    if text in DEEP_HOLE_SERVER_CODES:
+        return DEEP_HOLE_SERVER_CODES[text]
+    if text.isdigit():
+        return f"{int(text):02d}"
+    return text
+
+
+def _server_matches(value, target_server):
+    return _server_code(value) == _server_code(target_server) or str(value).strip() == str(target_server).strip()
+
+
+def _calculate_deep_hole_reset_seconds(reports, now):
+    if not reports or len(reports) < 5:
+        minute = now.minute
+        return ((30 if minute < 30 else 60) - minute - 1) * 60 + (60 - now.second)
+
+    minute_counts = {}
+    for report in reports:
+        expired = _parse_datetime(report.get("expired"), now.tzinfo)
+        if expired is None:
+            continue
+        minute_counts[expired.minute] = minute_counts.get(expired.minute, 0) + 1
+
+    top_minutes = [
+        minute for minute, _ in sorted(minute_counts.items(), key=lambda item: item[1], reverse=True)[:2]
+    ]
+    if not top_minutes:
+        minute = now.minute
+        return ((30 if minute < 30 else 60) - minute - 1) * 60 + (60 - now.second)
+
+    candidates = []
+    for minute in top_minutes:
+        candidate = now.replace(minute=minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(hours=1)
+        candidates.append(candidate)
+
+    seconds = int((min(candidates) - now).total_seconds())
+    if seconds > DEEP_HOLE_CHECK_INTERVAL_SECONDS:
+        seconds -= DEEP_HOLE_CHECK_INTERVAL_SECONDS
+    return max(0, seconds)
+
+
+def _extract_target_status_from_reports(reports, kst):
+    now = datetime.now(kst)
+    target_reports = []
+
+    for report in reports:
+        if not isinstance(report, dict):
+            continue
+        if not _server_matches(report.get("server"), DEEP_HOLE_TARGET_SERVER):
+            continue
+        if str(report.get("area", "")).strip() != DEEP_HOLE_TARGET_AREA:
+            continue
+
+        expired = _parse_datetime(report.get("expired"), kst)
+        if expired is None:
+            continue
+
+        started = expired - timedelta(seconds=DEEP_HOLE_APPEARANCE_SECONDS)
+        target_reports.append((started, expired, report))
+
+    reset_seconds = _calculate_deep_hole_reset_seconds(reports, now)
+
+    for started, expired, report in target_reports:
+        if started <= now < expired:
+            return {
+                "is_open": True,
+                "reset_seconds": reset_seconds,
+                "target_remaining_seconds": max(0, int((expired - now).total_seconds())),
+                "count": report.get("count") or 1,
+                "report": report,
+                "reports": reports,
+            }
+
+    return {
+        "is_open": False if reports else None,
+        "reset_seconds": reset_seconds,
+        "target_remaining_seconds": None,
+        "count": 0,
+        "report": None,
+        "reports": reports,
+    }
+
+
 def fetch_deep_hole_status(kst):
     req = urlrequest.Request(
         DEEP_HOLE_API_URL,
@@ -165,11 +376,10 @@ def fetch_deep_hole_status(kst):
         body = response.read().decode("utf-8")
     data = json.loads(body)
 
-    return {
-        "is_open": _extract_deep_hole_open_status(data),
-        "reset_seconds": _extract_deep_hole_reset_seconds(data, kst),
-        "raw": data,
-    }
+    reports = _parse_deep_hole_reports(data, kst)
+    status = _extract_target_status_from_reports(reports, kst)
+    status["raw"] = data
+    return status
 
 
 def get_deep_hole_room_ids(get_db_conn, db_lock):
@@ -208,12 +418,21 @@ def format_deep_hole_status(status):
     else:
         reset_text = f"{reset_seconds // 60:02d}:{reset_seconds % 60:02d}"
 
-    return (
-        f"심층 구멍 체크\n"
-        f"대상: {DEEP_HOLE_TARGET_SERVER} / {DEEP_HOLE_TARGET_AREA}\n"
-        f"상태: {open_text}\n"
-        f"리셋까지: {reset_text}"
-    )
+    lines = [
+        "심층 구멍 체크",
+        f"대상: {DEEP_HOLE_TARGET_SERVER} / {DEEP_HOLE_TARGET_AREA}",
+        f"상태: {open_text}",
+        f"리셋까지: {reset_text}",
+    ]
+
+    target_remaining_seconds = status.get("target_remaining_seconds")
+    if target_remaining_seconds is not None:
+        lines.append(f"대상 종료까지: {target_remaining_seconds // 60:02d}:{target_remaining_seconds % 60:02d}")
+
+    if status.get("count"):
+        lines.append(f"출현 수: {status['count']}")
+
+    return "\n".join(lines)
 
 
 def _next_wait_seconds(reset_seconds):
@@ -250,20 +469,29 @@ def start_deep_hole_tracker(bot, send_message, get_db_conn, db_lock, kst):
                 status = fetch_deep_hole_status(kst)
                 is_open = status.get("is_open")
                 reset_seconds = status.get("reset_seconds")
+                target_remaining_seconds = status.get("target_remaining_seconds")
                 room_ids = get_deep_hole_room_ids(get_db_conn, db_lock)
                 print(
                     f"[심구알림] {DEEP_HOLE_TARGET_SERVER}/{DEEP_HOLE_TARGET_AREA} "
-                    f"open={is_open} reset={reset_seconds} rooms={len(room_ids)}"
+                    f"open={is_open} reset={reset_seconds} target_remaining={target_remaining_seconds} "
+                    f"rooms={len(room_ids)}"
                 )
 
                 if is_open is True and state["last_is_open"] is not True:
                     if not room_ids:
                         print("[심구알림] 지정된 알림 채팅방이 없어 전송하지 않습니다.")
                     else:
-                        message = (
-                            f"심층 구멍 열림\n"
-                            f"{DEEP_HOLE_TARGET_SERVER} / {DEEP_HOLE_TARGET_AREA}"
-                        )
+                        lines = [
+                            "심층 구멍 열림",
+                            f"{DEEP_HOLE_TARGET_SERVER} / {DEEP_HOLE_TARGET_AREA}",
+                        ]
+                        if target_remaining_seconds is not None:
+                            lines.append(
+                                f"종료까지: {target_remaining_seconds // 60:02d}:{target_remaining_seconds % 60:02d}"
+                            )
+                        if status.get("count"):
+                            lines.append(f"출현 수: {status['count']}")
+                        message = "\n".join(lines)
                         for room_id in room_ids:
                             send_message(bot, room_id, message)
 
