@@ -18,6 +18,7 @@ DEEP_HOLE_DRIFT_THRESHOLD_SECONDS = 60
 DEEP_HOLE_REQUEST_TIMEOUT_SECONDS = 10
 DEEP_HOLE_TRACKER_ENABLED = os.getenv("DEEP_HOLE_TRACKER_ENABLED", "1").strip() != "0"
 DEEP_HOLE_APPEARANCE_SECONDS = 30 * 60
+DEEP_HOLE_REMINDER_SECONDS = 5 * 60
 DEEP_HOLE_DH_KEY = "8nvov88uc5k4o4g6apax04783thjo11l"
 DEEP_HOLE_SERVER_CODES = {
     "데이안": "01",
@@ -410,6 +411,18 @@ def select_deep_hole_room(room_id, added_by, get_db_conn, db_lock, kst):
         conn.close()
 
 
+def clear_deep_hole_room(room_id, get_db_conn, db_lock):
+    with db_lock:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM deep_hole_rooms WHERE room_id = ?", (str(room_id),))
+        deleted_count = cur.rowcount
+        conn.commit()
+        conn.close()
+
+    return deleted_count > 0
+
+
 def format_deep_hole_status(status):
     open_text = "열림" if status.get("is_open") is True else "닫힘" if status.get("is_open") is False else "확인불가"
     reset_seconds = status.get("reset_seconds")
@@ -435,14 +448,31 @@ def format_deep_hole_status(status):
     return "\n".join(lines)
 
 
-def _next_wait_seconds(reset_seconds):
-    wait_seconds = DEEP_HOLE_CHECK_INTERVAL_SECONDS
-    if reset_seconds is None:
-        return wait_seconds
+def _format_deep_hole_alert_message(status):
+    count = status.get("count") or 1
+    message = f"{DEEP_HOLE_TARGET_AREA} 지역에 심층 구멍 {count}개 출현하였습니다."
 
-    aligned_wait = max(5, reset_seconds + 3)
-    if abs(aligned_wait - DEEP_HOLE_CHECK_INTERVAL_SECONDS) > DEEP_HOLE_DRIFT_THRESHOLD_SECONDS:
-        return aligned_wait
+    target_remaining_seconds = status.get("target_remaining_seconds")
+    if target_remaining_seconds is not None:
+        remaining_minutes = max(0, int((target_remaining_seconds + 59) // 60))
+        message += f" 종료까지 {remaining_minutes}분 전"
+
+    return message
+
+
+def _next_wait_seconds(reset_seconds, target_remaining_seconds=None, reminder_sent=False):
+    wait_seconds = DEEP_HOLE_CHECK_INTERVAL_SECONDS
+
+    if reset_seconds is not None:
+        aligned_wait = max(5, reset_seconds + 3)
+        if abs(aligned_wait - DEEP_HOLE_CHECK_INTERVAL_SECONDS) > DEEP_HOLE_DRIFT_THRESHOLD_SECONDS:
+            wait_seconds = min(wait_seconds, aligned_wait)
+
+    if target_remaining_seconds is not None and not reminder_sent:
+        reminder_wait = target_remaining_seconds - DEEP_HOLE_REMINDER_SECONDS
+        if reminder_wait > 0:
+            wait_seconds = min(wait_seconds, max(5, reminder_wait + 1))
+
     return wait_seconds
 
 
@@ -458,7 +488,7 @@ def start_deep_hole_tracker(bot, send_message, get_db_conn, db_lock, kst):
             return
         _TRACKER_STARTED = True
 
-    state = {"last_is_open": None}
+    state = {"last_is_open": None, "five_min_alert_sent": False}
 
     def run():
         wait_seconds = 3
@@ -477,27 +507,43 @@ def start_deep_hole_tracker(bot, send_message, get_db_conn, db_lock, kst):
                     f"rooms={len(room_ids)}"
                 )
 
+                if is_open is not True:
+                    state["five_min_alert_sent"] = False
+
                 if is_open is True and state["last_is_open"] is not True:
                     if not room_ids:
                         print("[심구알림] 지정된 알림 채팅방이 없어 전송하지 않습니다.")
                     else:
-                        lines = [
-                            "심층 구멍 열림",
-                            f"{DEEP_HOLE_TARGET_SERVER} / {DEEP_HOLE_TARGET_AREA}",
-                        ]
-                        if target_remaining_seconds is not None:
-                            lines.append(
-                                f"종료까지: {target_remaining_seconds // 60:02d}:{target_remaining_seconds % 60:02d}"
-                            )
-                        if status.get("count"):
-                            lines.append(f"출현 수: {status['count']}")
-                        message = "\n".join(lines)
+                        message = _format_deep_hole_alert_message(status)
                         for room_id in room_ids:
                             send_message(bot, room_id, message)
+                    if (
+                        target_remaining_seconds is not None
+                        and target_remaining_seconds <= DEEP_HOLE_REMINDER_SECONDS
+                    ):
+                        state["five_min_alert_sent"] = True
+
+                elif (
+                    is_open is True
+                    and not state["five_min_alert_sent"]
+                    and target_remaining_seconds is not None
+                    and target_remaining_seconds <= DEEP_HOLE_REMINDER_SECONDS
+                ):
+                    if not room_ids:
+                        print("[심구알림] 지정된 알림 채팅방이 없어 5분 전 알림을 전송하지 않습니다.")
+                    else:
+                        message = _format_deep_hole_alert_message(status)
+                        for room_id in room_ids:
+                            send_message(bot, room_id, message)
+                    state["five_min_alert_sent"] = True
 
                 state["last_is_open"] = is_open
 
-                wait_seconds = _next_wait_seconds(reset_seconds)
+                wait_seconds = _next_wait_seconds(
+                    reset_seconds,
+                    target_remaining_seconds,
+                    state["five_min_alert_sent"],
+                )
                 if wait_seconds != DEEP_HOLE_CHECK_INTERVAL_SECONDS:
                     print(f"[심구알림] 사이트 리셋 타이머 기준으로 다음 체크 보정: {wait_seconds:.1f}초")
 

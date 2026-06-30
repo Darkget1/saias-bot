@@ -14,6 +14,7 @@ from bots.deep_hole_alert import (
     DEEP_HOLE_CHECK_INTERVAL_SECONDS,
     DEEP_HOLE_TARGET_AREA,
     DEEP_HOLE_TARGET_SERVER,
+    clear_deep_hole_room,
     create_deep_hole_tables,
     fetch_deep_hole_status,
     format_deep_hole_status,
@@ -628,9 +629,6 @@ def handle_user_commands(chat: ChatContext):
             return True
 
         if cmd == "/알림선택":
-            if not is_admin(chat.sender.id):
-                return False
-
             room_id = str(chat.room.id)
             select_deep_hole_room(room_id, chat.sender.id, get_db_conn, DB_LOCK, KST)
             chat.reply(
@@ -640,6 +638,21 @@ def handle_user_commands(chat: ChatContext):
                 f"체크 간격: {DEEP_HOLE_CHECK_INTERVAL_SECONDS // 60}분\n"
                 f"※ 기존 선택방은 해제되고, 이 채팅방에만 알림을 전송합니다."
             )
+            return True
+
+        if cmd == "/알림선택해제":
+            room_id = str(chat.room.id)
+            if clear_deep_hole_room(room_id, get_db_conn, DB_LOCK):
+                chat.reply(
+                    f"✅ 심구 알림 채팅방 선택 해제 완료\n"
+                    f"해제방: {room_id}\n"
+                    f"※ 이제 이 채팅방에는 심구 알림을 전송하지 않습니다."
+                )
+            else:
+                chat.reply(
+                    f"ℹ️ 현재 채팅방은 심구 알림방으로 선택되어 있지 않습니다.\n"
+                    f"선택방 변경은 알림 받을 채팅방에서 /알림선택 을 실행하세요."
+                )
             return True
 
         # ─────────────────────────────
