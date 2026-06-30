@@ -10,6 +10,18 @@ import os
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
+from bots.deep_hole_alert import (
+    DEEP_HOLE_CHECK_INTERVAL_SECONDS,
+    DEEP_HOLE_TARGET_AREA,
+    DEEP_HOLE_TARGET_SERVER,
+    create_deep_hole_tables,
+    fetch_deep_hole_status,
+    format_deep_hole_status,
+    get_deep_hole_room_ids,
+    select_deep_hole_room,
+    start_deep_hole_tracker,
+)
+
 # ─────────────────────────────
 # 관리자 설정
 # 초기 관리자는 .env의 ADMIN_IDS에 강제 등록
@@ -124,6 +136,7 @@ def init_db():
                         memo TEXT
                     )
                 """)
+        create_deep_hole_tables(cur)
 
 
         cur.execute("PRAGMA table_info(lotto)")
@@ -427,6 +440,8 @@ def safe_send_message(bot, room_id, text):
 # ─────────────────────────────
 
 def start_lotto_scheduler(bot):
+    start_deep_hole_tracker(bot, safe_send_message, get_db_conn, DB_LOCK, KST)
+
     def run():
         while True:
             now = datetime.now(KST)
@@ -569,6 +584,61 @@ def handle_user_commands(chat: ChatContext):
                 f"• 권한: {admin_status}\n"
                 f"────────\n"
                 f"💡 최초 관리자는 .env에 ADMIN_IDS={chat.sender.id} 형태로 추가 후 봇을 재시작하세요."
+            )
+            return True
+
+        if cmd == "/심층체크":
+            if not is_admin(chat.sender.id):
+                return False
+
+            try:
+                status = fetch_deep_hole_status(KST)
+                chat.reply(format_deep_hole_status(status))
+            except Exception as e:
+                chat.reply(f"⚠️ 심층 구멍 체크 실패\n{e}")
+            return True
+
+        if cmd == "/심구알림시작":
+            if not is_admin(chat.sender.id):
+                return False
+
+            room_ids = get_deep_hole_room_ids(get_db_conn, DB_LOCK)
+            if not room_ids:
+                chat.reply(
+                    "⚠️ 심구 알림 채팅방이 지정되지 않았습니다.\n"
+                    "알림 받을 채팅방에서 /알림선택 을 먼저 실행하세요.\n"
+                    "추적 스크립트는 봇 시작 시 자동 실행됩니다."
+                )
+                return True
+
+            try:
+                status = fetch_deep_hole_status(KST)
+                status_text = format_deep_hole_status(status)
+            except Exception as e:
+                status_text = f"현재 상태 확인 실패\n{e}"
+
+            chat.reply(
+                f"✅ 심구 알림 추적 중\n"
+                f"대상: {DEEP_HOLE_TARGET_SERVER} / {DEEP_HOLE_TARGET_AREA}\n"
+                f"체크 간격: {DEEP_HOLE_CHECK_INTERVAL_SECONDS // 60}분\n"
+                f"알림방: {', '.join(room_ids)}\n"
+                f"※ 알림은 지정된 채팅방에만 전송됩니다.\n\n"
+                f"{status_text}"
+            )
+            return True
+
+        if cmd == "/알림선택":
+            if not is_admin(chat.sender.id):
+                return False
+
+            room_id = str(chat.room.id)
+            select_deep_hole_room(room_id, chat.sender.id, get_db_conn, DB_LOCK, KST)
+            chat.reply(
+                f"✅ 심구 알림 채팅방 선택 완료\n"
+                f"선택방: {room_id}\n"
+                f"대상: {DEEP_HOLE_TARGET_SERVER} / {DEEP_HOLE_TARGET_AREA}\n"
+                f"체크 간격: {DEEP_HOLE_CHECK_INTERVAL_SECONDS // 60}분\n"
+                f"※ 기존 선택방은 해제되고, 이 채팅방에만 알림을 전송합니다."
             )
             return True
 
