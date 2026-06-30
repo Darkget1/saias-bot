@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib import request as urlrequest
 
 
@@ -15,6 +16,7 @@ DEEP_HOLE_TARGET_SERVER = os.getenv("DEEP_HOLE_TARGET_SERVER", "던컨")
 DEEP_HOLE_TARGET_AREA = os.getenv("DEEP_HOLE_TARGET_AREA", "창백한 산")
 DEEP_HOLE_CHECK_INTERVAL_SECONDS = 30 * 60
 DEEP_HOLE_DRIFT_THRESHOLD_SECONDS = 60
+DEEP_HOLE_TIME_SYNC_THRESHOLD_SECONDS = 60
 DEEP_HOLE_REQUEST_TIMEOUT_SECONDS = 10
 DEEP_HOLE_TRACKER_ENABLED = os.getenv("DEEP_HOLE_TRACKER_ENABLED", "1").strip() != "0"
 DEEP_HOLE_APPEARANCE_SECONDS = 30 * 60
@@ -326,8 +328,30 @@ def _calculate_deep_hole_reset_seconds(reports, now):
     return max(0, seconds)
 
 
-def _extract_target_status_from_reports(reports, kst):
-    now = datetime.now(kst)
+def _reference_now_from_date_header(date_header, kst):
+    local_now = datetime.now(kst)
+    if not date_header:
+        return local_now, 0, False
+
+    try:
+        site_now = parsedate_to_datetime(date_header)
+    except Exception:
+        return local_now, 0, False
+
+    if site_now.tzinfo is None:
+        site_now = site_now.replace(tzinfo=timezone.utc)
+    site_now = site_now.astimezone(kst)
+
+    offset_seconds = int((site_now - local_now).total_seconds())
+    if abs(offset_seconds) >= DEEP_HOLE_TIME_SYNC_THRESHOLD_SECONDS:
+        return site_now, offset_seconds, True
+
+    return local_now, offset_seconds, False
+
+
+def _extract_target_status_from_reports(reports, kst, now=None):
+    if now is None:
+        now = datetime.now(kst)
     target_reports = []
 
     for report in reports:
@@ -374,11 +398,15 @@ def fetch_deep_hole_status(kst):
         headers=_deep_hole_headers(),
     )
     with urlrequest.urlopen(req, timeout=DEEP_HOLE_REQUEST_TIMEOUT_SECONDS) as response:
+        date_header = response.headers.get("Date")
         body = response.read().decode("utf-8")
     data = json.loads(body)
 
     reports = _parse_deep_hole_reports(data, kst)
-    status = _extract_target_status_from_reports(reports, kst)
+    reference_now, time_offset_seconds, time_sync_applied = _reference_now_from_date_header(date_header, kst)
+    status = _extract_target_status_from_reports(reports, kst, reference_now)
+    status["time_offset_seconds"] = time_offset_seconds
+    status["time_sync_applied"] = time_sync_applied
     status["raw"] = data
     return status
 
@@ -445,6 +473,10 @@ def format_deep_hole_status(status):
     if status.get("count"):
         lines.append(f"출현 수: {status['count']}")
 
+    if status.get("time_sync_applied"):
+        offset_seconds = status.get("time_offset_seconds", 0)
+        lines.append(f"시간 보정: {offset_seconds:+d}초")
+
     return "\n".join(lines)
 
 
@@ -500,11 +532,13 @@ def start_deep_hole_tracker(bot, send_message, get_db_conn, db_lock, kst):
                 is_open = status.get("is_open")
                 reset_seconds = status.get("reset_seconds")
                 target_remaining_seconds = status.get("target_remaining_seconds")
+                time_offset_seconds = status.get("time_offset_seconds", 0)
+                time_sync_applied = status.get("time_sync_applied")
                 room_ids = get_deep_hole_room_ids(get_db_conn, db_lock)
                 print(
                     f"[심구알림] {DEEP_HOLE_TARGET_SERVER}/{DEEP_HOLE_TARGET_AREA} "
                     f"open={is_open} reset={reset_seconds} target_remaining={target_remaining_seconds} "
-                    f"rooms={len(room_ids)}"
+                    f"time_offset={time_offset_seconds} sync={time_sync_applied} rooms={len(room_ids)}"
                 )
 
                 if is_open is not True:
