@@ -1,7 +1,11 @@
 BARTER_SOURCE_NOTE = "이멘마하 요리(제작대 Lv.6)"
 
 BARTER_COMMANDS = {"/물교", "/물교정보", "/물교검색", "/물교찾기", "/물교정보찾기"}
-BARTER_LIST_COMMANDS = {"/물교목록"}
+BARTER_LIST_COMMANDS = {"/물교목록", "/물교리스트", "/물교도움말"}
+BARTER_LIST_KEYWORDS = {"목록", "리스트", "도움말", "사용법", "help", "?"}
+BARTER_SEARCH_ALIASES = {
+    "백금강괴": "백금광괴",
+}
 
 BARTER_RECIPES = [
     {
@@ -300,6 +304,20 @@ def _format_recipe(cur, row):
     )
 
 
+def _compact_text(value):
+    return "".join(str(value or "").split()).lower()
+
+
+def _search_terms(query):
+    terms = []
+    raw = str(query or "").strip()
+    compact = _compact_text(raw)
+    for term in (raw, compact, BARTER_SEARCH_ALIASES.get(compact)):
+        if term and term not in terms:
+            terms.append(term)
+    return terms
+
+
 def _format_barter_help(cur):
     cur.execute(
         """
@@ -320,32 +338,75 @@ def _format_barter_help(cur):
 
 
 def search_barter_info(cur, query, max_recipes=4, max_sources=6):
-    keyword = f"%{query}%"
+    terms = _search_terms(query)
+    recipe_clauses = []
+    recipe_params = []
+    for term in terms:
+        keyword = f"%{term}%"
+        if term == _compact_text(term):
+            recipe_clauses.append(
+                """
+                REPLACE(r.trader, ' ', '') LIKE ?
+                OR REPLACE(r.dish_name, ' ', '') LIKE ?
+                OR REPLACE(r.reward_item, ' ', '') LIKE ?
+                OR REPLACE(m.material_name, ' ', '') LIKE ?
+                """
+            )
+        else:
+            recipe_clauses.append(
+                """
+                r.trader LIKE ?
+                OR r.dish_name LIKE ?
+                OR r.reward_item LIKE ?
+                OR m.material_name LIKE ?
+                """
+            )
+        recipe_params.extend([keyword, keyword, keyword, keyword])
+
+    source_clauses = []
+    source_params = []
+    for term in terms:
+        keyword = f"%{term}%"
+        if term == _compact_text(term):
+            source_clauses.append(
+                """
+                REPLACE(material_name, ' ', '') LIKE ?
+                OR REPLACE(category, ' ', '') LIKE ?
+                OR REPLACE(source, ' ', '') LIKE ?
+                OR REPLACE(gather_method, ' ', '') LIKE ?
+                OR REPLACE(note, ' ', '') LIKE ?
+                """
+            )
+        else:
+            source_clauses.append(
+                """
+                material_name LIKE ?
+                OR category LIKE ?
+                OR source LIKE ?
+                OR gather_method LIKE ?
+                OR note LIKE ?
+                """
+            )
+        source_params.extend([keyword, keyword, keyword, keyword, keyword])
+
     cur.execute(
-        """
+        f"""
         SELECT DISTINCT r.*
         FROM barter_recipes r
         LEFT JOIN barter_recipe_materials m ON m.recipe_id = r.recipe_id
-        WHERE r.trader LIKE ?
-           OR r.dish_name LIKE ?
-           OR r.reward_item LIKE ?
-           OR m.material_name LIKE ?
+        WHERE {" OR ".join(f"({clause})" for clause in recipe_clauses)}
         ORDER BY r.recipe_id
         LIMIT ?
         """,
-        (keyword, keyword, keyword, keyword, max_recipes),
+        (*recipe_params, max_recipes),
     )
     recipes = cur.fetchall()
 
     cur.execute(
-        """
+        f"""
         SELECT *
         FROM barter_material_sources
-        WHERE material_name LIKE ?
-           OR category LIKE ?
-           OR source LIKE ?
-           OR gather_method LIKE ?
-           OR note LIKE ?
+        WHERE {" OR ".join(f"({clause})" for clause in source_clauses)}
         ORDER BY
             CASE category
                 WHEN '구매 재료' THEN 1
@@ -356,7 +417,7 @@ def search_barter_info(cur, query, max_recipes=4, max_sources=6):
             id
         LIMIT ?
         """,
-        (keyword, keyword, keyword, keyword, keyword, max_sources),
+        (*source_params, max_sources),
     )
     sources = cur.fetchall()
 
@@ -381,17 +442,47 @@ def search_barter_info(cur, query, max_recipes=4, max_sources=6):
     return "\n".join(lines).strip()
 
 
+def _message_attr_text(message):
+    for attr_name in ("text", "msg", "content", "raw", "body"):
+        value = getattr(message, attr_name, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _barter_command_from_chat(chat):
+    message = chat.message
+    cmd = str(getattr(message, "command", "") or "").strip()
+    param = str(getattr(message, "param", "") or "").strip()
+
+    if not cmd:
+        text = _message_attr_text(message)
+        if text.startswith("/"):
+            parts = text.split(maxsplit=1)
+            cmd = parts[0].strip()
+            if not param and len(parts) > 1:
+                param = parts[1].strip()
+
+    if cmd.startswith("/물교") and cmd not in BARTER_COMMANDS and cmd not in BARTER_LIST_COMMANDS:
+        suffix = cmd.removeprefix("/물교").strip()
+        if suffix in BARTER_LIST_KEYWORDS:
+            cmd = "/물교목록"
+        elif suffix:
+            param = f"{suffix} {param}".strip()
+            cmd = "/물교"
+
+    return cmd, param
+
+
 def handle_barter_commands(chat, get_db_conn, db_lock):
-    cmd = getattr(chat.message, "command", "")
+    cmd, query = _barter_command_from_chat(chat)
     if cmd not in BARTER_COMMANDS and cmd not in BARTER_LIST_COMMANDS:
         return False
-
-    query = getattr(chat.message, "param", "").strip()
 
     with db_lock:
         conn = get_db_conn()
         cur = conn.cursor()
-        if cmd in BARTER_LIST_COMMANDS or not query:
+        if cmd in BARTER_LIST_COMMANDS or not query or query.lower() in BARTER_LIST_KEYWORDS:
             message = _format_barter_help(cur)
         else:
             message = search_barter_info(cur, query)
