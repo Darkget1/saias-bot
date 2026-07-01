@@ -388,7 +388,12 @@ def _get_or_create_user(chat: ChatContext):
             updates.append("name = ?")
             params.append(current_name)
 
-            chat.reply(f"📝 닉네임 변경 감지\n[{old_name}] ➜ [{current_name}]")
+            print(f"[닉네임변경] user_id={uid} {old_name} -> {current_name}")
+            chat.reply(
+                f"닉네임 변경 감지\n"
+                f"{old_name} -> {current_name}\n"
+                f"닉네임이 수정되었습니다."
+            )
             user['name'] = current_name
 
         # 2. 직업 업데이트 확인 (추출된 직업이 있고, 기존과 다를 때만)
@@ -406,9 +411,14 @@ def _get_or_create_user(chat: ChatContext):
             conn.commit()
 
         # 채팅 카운트 업데이트
-        new_cnt = 1 if user['last_chat_date'] != today else user['today_chat'] + 1
+        total_chat = int(user.get('total_chat') or 0)
+        today_chat = int(user.get('today_chat') or 0)
+        new_cnt = 1 if user['last_chat_date'] != today else today_chat + 1
         cur.execute("UPDATE users SET total_chat=total_chat+1, today_chat=?, last_chat_date=? WHERE user_id=?",
                     (new_cnt, today, uid))
+        user['total_chat'] = total_chat + 1
+        user['today_chat'] = new_cnt
+        user['last_chat_date'] = today
         conn.commit()
         conn.close()
 
@@ -575,6 +585,7 @@ def handle_user_commands(chat: ChatContext):
     try:
         admin_id = chat.sender.id
         cmd = getattr(chat.message, "command", "")
+        user = _get_or_create_user(chat)
 
         if handle_barter_commands(chat, get_db_conn, DB_LOCK):
             return True
@@ -816,8 +827,6 @@ def handle_user_commands(chat: ChatContext):
             else:
                 chat.reply("⚠️ 올바른 형식이 아닙니다.\n예시: /유저삭제동의 YES 또는 /유저삭제동의 NO")
                 return True
-
-        user = _get_or_create_user(chat)
 
         if cmd == "ㅊㅊ" or cmd in ["/ㅊㅊ", "!ㅊㅊ"]:
             today_str = datetime.now(KST).date().isoformat()
