@@ -4,7 +4,7 @@ import threading
 import time
 from datetime import datetime, date, timedelta
 import pytz
-from iris import ChatContext
+from iris import ChatContext, PyKV
 import re
 import os
 from dotenv import load_dotenv
@@ -378,10 +378,77 @@ def _sender_debug_snapshot(sender):
     return ", ".join(f"{key}={_safe_debug_text(value)}" for key, value in values.items())
 
 
+def _get_chat_room_id(chat):
+    room = getattr(chat, "room", None)
+    room_id = getattr(room, "id", None)
+    if room_id is not None:
+        return str(room_id)
+
+    message = getattr(chat, "message", None)
+    for attr_name in ("room_id", "chat_id", "involved_chat_id"):
+        value = getattr(message, attr_name, None)
+        if value is not None:
+            return str(value)
+
+    return None
+
+
+def _latest_open_chat_nickname(user_id, room_id=None):
+    try:
+        history = PyKV().get("user_history")
+    except Exception as exc:
+        print(f"[닉네임소스] PyKV user_history 조회 실패: {exc}", flush=True)
+        return None
+
+    if not isinstance(history, dict):
+        return None
+
+    user_history = None
+    for key in (user_id, str(user_id)):
+        if key in history:
+            user_history = history[key]
+            break
+
+    if user_history is None:
+        for key, value in history.items():
+            if str(key) == str(user_id):
+                user_history = value
+                break
+
+    if not isinstance(user_history, dict):
+        return None
+
+    entries = user_history.get("history")
+    if not isinstance(entries, list):
+        return None
+
+    candidates = list(reversed(entries))
+    if room_id:
+        room_candidates = [
+            entry for entry in candidates
+            if isinstance(entry, dict) and str(entry.get("involved_chat_id")) == str(room_id)
+        ]
+        if room_candidates:
+            candidates = room_candidates
+
+    for entry in candidates:
+        if not isinstance(entry, dict):
+            continue
+        nickname = str(entry.get("nickname") or "").strip()
+        if nickname:
+            return nickname
+
+    return None
+
+
 def _get_or_create_user(chat: ChatContext):
     uid = chat.sender.id
-    current_name = str(chat.sender.name or f"User{uid}").strip()
     cmd = getattr(chat.message, "command", "")
+    sender_name = str(chat.sender.name or f"User{uid}").strip()
+    room_id = _get_chat_room_id(chat)
+    open_chat_name = _latest_open_chat_nickname(uid, room_id)
+    current_name = open_chat_name or sender_name
+    name_source = "open_chat_member" if open_chat_name else "sender.name"
     today = datetime.now(KST).date().isoformat()
     now_time = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -413,7 +480,9 @@ def _get_or_create_user(chat: ChatContext):
         if should_log_nickname_check:
             print(
                 f"[닉네임체크] cmd={cmd or '-'} user_id={uid} "
-                f"sender.name={current_name!r} db.name={db_name_before!r} "
+                f"name.source={name_source} current.name={current_name!r} "
+                f"sender.name={sender_name!r} open_chat.nickname={open_chat_name!r} "
+                f"db.name={db_name_before!r} room_id={room_id!r} "
                 f"sender=({_sender_debug_snapshot(chat.sender)})",
                 flush=True,
             )

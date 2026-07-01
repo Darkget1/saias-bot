@@ -40,6 +40,7 @@ def detect_nickname_change(base_url):
                         "date": ""
                     }]
                     }
+                    changed = True
                 else:
                     if members[user_id]["nickname"] != history[user_id]["history"][-1]["nickname"]:
                         korean = pytz.timezone('Asia/Seoul')
@@ -51,6 +52,7 @@ def detect_nickname_change(base_url):
                                 "date":time_string
                             }
                         )
+                        changed = True
                         
                         if members[user_id]["involved_chat_id"] in detect_rooms:
                             user_history = []
@@ -63,7 +65,6 @@ def detect_nickname_change(base_url):
                             message = f"닉네임이 변경되었어요!\n{history[user_id]['history'][-2]['nickname']} -> {members[user_id]['nickname']}\n" + "\u200b"*600 + "\n" + history_string
                             
                             bot.api.reply(int(members[user_id]["involved_chat_id"]),message.strip())
-                            changed = True
                 
             if changed:
                 kv.put('user_history',history)
