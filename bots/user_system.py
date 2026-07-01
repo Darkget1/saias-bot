@@ -346,9 +346,42 @@ def _pick_lotto_winning_number(tickets):
     return _generate_lotto_number()
 
 
+def _safe_debug_text(value, limit=120):
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _sender_debug_snapshot(sender):
+    values = {}
+    for attr_name in (
+        "id",
+        "name",
+        "nickname",
+        "profile_name",
+        "open_profile_name",
+        "display_name",
+        "user_name",
+    ):
+        if hasattr(sender, attr_name):
+            try:
+                values[attr_name] = getattr(sender, attr_name)
+            except Exception as exc:
+                values[attr_name] = f"<error:{exc}>"
+
+    raw_dict = getattr(sender, "__dict__", None)
+    if isinstance(raw_dict, dict):
+        for key, value in raw_dict.items():
+            if key.startswith("_") or key in values:
+                continue
+            values[key] = value
+
+    return ", ".join(f"{key}={_safe_debug_text(value)}" for key, value in values.items())
+
+
 def _get_or_create_user(chat: ChatContext):
     uid = chat.sender.id
     current_name = str(chat.sender.name or f"User{uid}").strip()
+    cmd = getattr(chat.message, "command", "")
     today = datetime.now(KST).date().isoformat()
     now_time = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -374,6 +407,16 @@ def _get_or_create_user(chat: ChatContext):
             row = cur.execute("SELECT * FROM users WHERE user_id = ?", (uid,)).fetchone()
 
         user = dict(row)
+        db_name_before = str(user.get('name') or "")
+        nickname_debug_enabled = os.getenv("NICKNAME_DEBUG_LOG", "0").strip() == "1"
+        should_log_nickname_check = cmd == "/내정보" or db_name_before != current_name or nickname_debug_enabled
+        if should_log_nickname_check:
+            print(
+                f"[닉네임체크] cmd={cmd or '-'} user_id={uid} "
+                f"sender.name={current_name!r} db.name={db_name_before!r} "
+                f"sender=({_sender_debug_snapshot(chat.sender)})",
+                flush=True,
+            )
 
         # ✅ 닉네임 변경 감지 및 직업 업데이트
         updates = []
@@ -388,7 +431,11 @@ def _get_or_create_user(chat: ChatContext):
             updates.append("name = ?")
             params.append(current_name)
 
-            print(f"[닉네임변경] user_id={uid} {old_name} -> {current_name}")
+            print(
+                f"[닉네임변경] user_id={uid} old={old_name!r} new={current_name!r} "
+                f"change_date={now_time}",
+                flush=True,
+            )
             chat.reply(
                 f"닉네임 변경 감지\n"
                 f"{old_name} -> {current_name}\n"
@@ -409,6 +456,12 @@ def _get_or_create_user(chat: ChatContext):
             params.append(uid)
             cur.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", params)
             conn.commit()
+            if should_log_nickname_check:
+                print(
+                    f"[닉네임체크완료] user_id={uid} saved.name={user.get('name')!r} "
+                    f"saved.job={user.get('job')!r}",
+                    flush=True,
+                )
 
         # 채팅 카운트 업데이트
         total_chat = int(user.get('total_chat') or 0)
