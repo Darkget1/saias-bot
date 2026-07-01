@@ -10,6 +10,11 @@ import os
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
+from bots.barter_info import (
+    create_barter_tables,
+    handle_barter_commands,
+    seed_barter_data,
+)
 from bots.deep_hole_alert import (
     DEEP_HOLE_CHECK_INTERVAL_SECONDS,
     DEEP_HOLE_TARGET_AREA,
@@ -138,6 +143,8 @@ def init_db():
                     )
                 """)
         create_deep_hole_tables(cur)
+        create_barter_tables(cur)
+        seed_barter_data(cur)
 
 
         cur.execute("PRAGMA table_info(lotto)")
@@ -568,6 +575,9 @@ def handle_user_commands(chat: ChatContext):
     try:
         admin_id = chat.sender.id
         cmd = getattr(chat.message, "command", "")
+
+        if handle_barter_commands(chat, get_db_conn, DB_LOCK):
+            return True
 
         # ─────────────────────────────
         # 관리자 ID 확인
