@@ -589,8 +589,8 @@ def start_lotto_scheduler(bot):
             # ✅ 테스트용: 1분 뒤 실행 (테스트 끝나면 주석 처리)
             # target = now + timedelta(minutes=1)
 
-            # [운영용] 매일 오전 7시
-            target = now.replace(hour=7, minute=0, second=0, microsecond=0)
+            # [운영용] 매일 오전 6시
+            target = now.replace(hour=6, minute=0, second=0, microsecond=0)
             if now >= target:
                 target += timedelta(days=1)
 
@@ -1094,7 +1094,7 @@ def handle_user_commands(chat: ChatContext):
                 row = cur.fetchone()
 
                 if row:
-                    chat.reply(f"🎫 이미 추첨 대기 중인 복권이 있습니다.\n번호: [{row['numbers']}]\n(매일 오전 7시 당첨 결과를 공개!)")
+                    chat.reply(f"🎫 이미 추첨 대기 중인 복권이 있습니다.\n번호: [{row['numbers']}]\n(매일 오전 6시 당첨 결과를 공개!)")
                 else:
                     new_nums = _generate_lotto_number()
                     cur.execute(
