@@ -15,6 +15,11 @@ from bots.barter_info import (
     handle_barter_commands,
     seed_barter_data,
 )
+from bots.rune_info import (
+    create_rune_tables,
+    handle_rune_commands,
+    seed_rune_data,
+)
 from bots.deep_hole_alert import (
     DEEP_HOLE_CHECK_INTERVAL_SECONDS,
     DEEP_HOLE_TARGET_AREA,
@@ -144,7 +149,9 @@ def init_db():
                 """)
         create_deep_hole_tables(cur)
         create_barter_tables(cur)
+        create_rune_tables(cur)
         seed_barter_data(cur)
+        seed_rune_data(cur)
 
 
         cur.execute("PRAGMA table_info(lotto)")
@@ -710,6 +717,9 @@ def handle_user_commands(chat: ChatContext):
         user = _get_or_create_user(chat)
 
         if handle_barter_commands(chat, get_db_conn, DB_LOCK):
+            return True
+
+        if handle_rune_commands(chat, get_db_conn, DB_LOCK):
             return True
 
         # ─────────────────────────────
