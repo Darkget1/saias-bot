@@ -20,6 +20,16 @@ from bots.rune_info import (
     handle_rune_commands,
     seed_rune_data,
 )
+from bots.abyss_hole_alert import (
+    ABYSS_HOLE_CHECK_INTERVAL_SECONDS,
+    clear_abyss_hole_room,
+    create_abyss_hole_tables,
+    fetch_abyss_hole_status,
+    format_abyss_hole_status,
+    get_abyss_hole_room_ids,
+    select_abyss_hole_room,
+    start_abyss_hole_tracker,
+)
 from bots.deep_hole_alert import (
     DEEP_HOLE_CHECK_INTERVAL_SECONDS,
     DEEP_HOLE_TARGET_AREA,
@@ -148,6 +158,7 @@ def init_db():
                     )
                 """)
         create_deep_hole_tables(cur)
+        create_abyss_hole_tables(cur)
         create_barter_tables(cur)
         create_rune_tables(cur)
         seed_barter_data(cur)
@@ -588,6 +599,7 @@ def safe_send_message(bot, room_id, text):
 
 def start_lotto_scheduler(bot):
     start_deep_hole_tracker(bot, safe_send_message, get_db_conn, DB_LOCK, KST)
+    start_abyss_hole_tracker(bot, safe_send_message, get_db_conn, DB_LOCK, KST)
 
     def run():
         while True:
@@ -779,6 +791,71 @@ def handle_user_commands(chat: ChatContext):
                 f"※ 알림은 지정된 채팅방에만 전송됩니다.\n\n"
                 f"{status_text}"
             )
+            return True
+
+        if cmd in ("/어구체크", "/어비스체크"):
+            if not is_admin(chat.sender.id):
+                return False
+
+            try:
+                status = fetch_abyss_hole_status(KST)
+                chat.reply(format_abyss_hole_status(status))
+            except Exception as e:
+                chat.reply(f"⚠️ 어비스 구멍 체크 실패\n{e}")
+            return True
+
+        if cmd in ("/어구알림시작", "/어비스알림시작"):
+            if not is_admin(chat.sender.id):
+                return False
+
+            room_ids = get_abyss_hole_room_ids(get_db_conn, DB_LOCK)
+            if not room_ids:
+                chat.reply(
+                    "⚠️ 어구 알림 채팅방이 지정되지 않았습니다.\n"
+                    "알림 받을 채팅방에서 /어구알림선택 을 먼저 실행하세요.\n"
+                    "추적 스크립트는 봇 시작 시 자동 실행됩니다."
+                )
+                return True
+
+            try:
+                status = fetch_abyss_hole_status(KST)
+                status_text = format_abyss_hole_status(status)
+            except Exception as e:
+                status_text = f"현재 상태 확인 실패\n{e}"
+
+            chat.reply(
+                f"✅ 어구 알림 추적 중\n"
+                f"체크 간격: {ABYSS_HOLE_CHECK_INTERVAL_SECONDS // 60}분\n"
+                f"알림방: {', '.join(room_ids)}\n"
+                f"※ 알림은 지정된 채팅방에만 전송됩니다.\n\n"
+                f"{status_text}"
+            )
+            return True
+
+        if cmd in ("/어구알림선택", "/어비스알림선택"):
+            room_id = str(chat.room.id)
+            select_abyss_hole_room(room_id, chat.sender.id, get_db_conn, DB_LOCK, KST)
+            chat.reply(
+                f"✅ 어구 알림 채팅방 선택 완료\n"
+                f"선택방: {room_id}\n"
+                f"체크 간격: {ABYSS_HOLE_CHECK_INTERVAL_SECONDS // 60}분\n"
+                f"※ 기존 선택방은 해제되고, 이 채팅방에만 알림을 전송합니다."
+            )
+            return True
+
+        if cmd in ("/어구알림선택해제", "/어비스알림선택해제"):
+            room_id = str(chat.room.id)
+            if clear_abyss_hole_room(room_id, get_db_conn, DB_LOCK):
+                chat.reply(
+                    f"✅ 어구 알림 채팅방 선택 해제 완료\n"
+                    f"해제방: {room_id}\n"
+                    f"※ 이제 이 채팅방에는 어구 알림을 전송하지 않습니다."
+                )
+            else:
+                chat.reply(
+                    f"ℹ️ 현재 채팅방은 어구 알림방으로 선택되어 있지 않습니다.\n"
+                    f"선택방 변경은 알림 받을 채팅방에서 /어구알림선택 을 실행하세요."
+                )
             return True
 
         if cmd == "/알림선택":
