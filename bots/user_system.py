@@ -465,6 +465,17 @@ def _get_chat_room_id(chat):
     return None
 
 
+def _command_param(chat):
+    """
+    명령어 뒤에 붙은 인자를 안전하게 꺼냅니다.
+
+    getattr(msg, "param", "") 는 속성이 '없을 때만' 기본값을 돌려줍니다.
+    Iris는 인자 없이 온 명령에 param=None 을 채워 넣으므로 속성은 존재하고,
+    그대로 .strip() 을 부르면 AttributeError 로 명령 전체가 죽습니다.
+    """
+    return str(getattr(getattr(chat, "message", None), "param", "") or "").strip()
+
+
 def _latest_open_chat_nickname(user_id, room_id=None):
     try:
         history = PyKV().get("user_history")
@@ -1022,7 +1033,7 @@ def handle_user_commands(chat: ChatContext):
             if not is_admin(chat.sender.id):
                 return False
 
-            param = getattr(chat.message, "param", "").strip()
+            param = _command_param(chat)
 
             if not param:
                 chat.reply(
@@ -1064,7 +1075,7 @@ def handle_user_commands(chat: ChatContext):
             if not is_admin(chat.sender.id):
                 return False
 
-            param = getattr(chat.message, "param", "").strip()
+            param = _command_param(chat)
 
             if not param:
                 chat.reply(
@@ -1130,7 +1141,7 @@ def handle_user_commands(chat: ChatContext):
             if not is_admin(admin_id):
                 return False
 
-            param = getattr(chat.message, "param", "").strip().upper()
+            param = _command_param(chat).upper()
 
             if admin_id not in pending_deletions:
                 chat.reply("⚠️ 현재 삭제 대기 중인 유저가 없습니다.")
@@ -1356,7 +1367,7 @@ def handle_user_commands(chat: ChatContext):
             return True
 
         if cmd == "/구매":
-            target_item = getattr(chat.message, "param", "").strip()
+            target_item = _command_param(chat)
 
             if not target_item:
                 chat.reply("⚠️ 구매하실 아이템 이름을 입력해주세요.\n예: /구매 확성기")
@@ -1428,7 +1439,7 @@ def handle_user_commands(chat: ChatContext):
             if not is_admin(chat.sender.id):
                 return False
 
-            param = getattr(chat.message, "param", "").strip()
+            param = _command_param(chat)
             parts = param.split(maxsplit=2)
 
             if len(parts) < 3:
@@ -1465,7 +1476,7 @@ def handle_user_commands(chat: ChatContext):
             if not is_admin(chat.sender.id):
                 return False
 
-            item_name = getattr(chat.message, "param", "").strip()
+            item_name = _command_param(chat)
 
             if not item_name:
                 chat.reply("⚠️ 삭제할 아이템 이름을 입력해주세요.\n예: /상점삭제 경험치부스터")
@@ -1572,7 +1583,7 @@ def handle_user_commands(chat: ChatContext):
             if not is_admin(chat.sender.id):
                 return False
 
-            param = getattr(chat.message, "param", "").strip()
+            param = _command_param(chat)
             parts = param.split()
 
             if not parts or not parts[0].isdigit():
@@ -1691,7 +1702,7 @@ def handle_user_commands(chat: ChatContext):
             action_filter = "사용" if cmd == "/사용내역" else None
             limit = SHOP_LOG_DEFAULT_LIMIT
 
-            for token in getattr(chat.message, "param", "").strip().split():
+            for token in _command_param(chat).split():
                 if token in SHOP_LOG_ACTIONS:
                     action_filter = token
                 elif token.isdigit():
@@ -1788,7 +1799,7 @@ def handle_user_commands(chat: ChatContext):
             if not is_admin(chat.sender.id):
                 return False
 
-            param = getattr(chat.message, "param", "").strip()
+            param = _command_param(chat)
 
             if not param.isdigit():
                 chat.reply("⚠️ 삭제할 유저의 '번호'를 입력해주세요.\n예: /유저삭제 3")
