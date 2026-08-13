@@ -163,6 +163,44 @@ def init_db():
                     )
                 """)
 
+        # ✅ 상점 활동 통합 로그 테이블
+        # 구매(/구매)와 사용 처리(/사용처리)를 한 테이블에 모아 /상점로그 로 조회합니다.
+        # user_name / item_name 을 함께 저장하는 이유:
+        #   유저가 닉네임을 바꾸거나 /유저삭제 되어도, 아이템이 /상점삭제 되어도
+        #   "그 시점에 누가 무엇을" 했는지가 그대로 읽혀야 하기 때문입니다.
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS shop_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        action TEXT NOT NULL,
+                        user_id INTEGER,
+                        user_name TEXT,
+                        item_id INTEGER,
+                        item_name TEXT,
+                        quantity INTEGER,
+                        price INTEGER,
+                        points_after INTEGER,
+                        processed_by INTEGER,
+                        log_date TEXT
+                    )
+                """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_shop_logs_action ON shop_logs(action, id DESC)")
+
+        # ✅ 기존 item_usage_logs 를 shop_logs 로 1회 이관합니다.
+        # 원본은 지우지 않고 복사만 하므로, 문제가 생겨도 되돌릴 수 있습니다.
+        # shop_logs 가 비어 있을 때만 수행되어 재시작마다 중복 적재되지 않습니다.
+        cur.execute("SELECT COUNT(*) AS count FROM shop_logs")
+        if cur.fetchone()["count"] == 0:
+            cur.execute("""
+                        INSERT INTO shop_logs
+                            (action, user_id, user_name, item_id, item_name,
+                             quantity, price, points_after, processed_by, log_date)
+                        SELECT '사용', old.user_id, u.name, old.item_id, old.item_name,
+                               old.quantity, NULL, NULL, old.processed_by, old.processed_date
+                        FROM item_usage_logs old
+                        LEFT JOIN users u ON old.user_id = u.user_id
+                        ORDER BY old.id ASC
+                    """)
+
         # ✅ 관리자 테이블
         # .env에 들어있는 초기 관리자와 명령어로 추가한 관리자를 모두 저장합니다.
         cur.execute("""
@@ -473,6 +511,51 @@ def _latest_open_chat_nickname(user_id, room_id=None):
             return nickname
 
     return None
+
+
+SHOP_LOG_ACTIONS = ("구매", "사용")
+SHOP_LOG_DEFAULT_LIMIT = 15
+SHOP_LOG_MAX_LIMIT = 30
+
+
+def _write_shop_log(cur, action, user_id, user_name, item_id, item_name, quantity,
+                    price=None, points_after=None, processed_by=None, log_date=None):
+    """
+    상점 활동 로그 1건 기록.
+
+    호출한 쪽의 트랜잭션에 얹히므로 여기서 commit 하지 않습니다.
+    실패 시 호출부의 rollback 으로 본 처리와 함께 되돌아가야 하기 때문입니다.
+    """
+    if log_date is None:
+        log_date = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+    cur.execute("""
+                INSERT INTO shop_logs
+                    (action, user_id, user_name, item_id, item_name,
+                     quantity, price, points_after, processed_by, log_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (action, user_id, user_name, item_id, item_name,
+                  quantity, price, points_after, processed_by, log_date))
+
+
+def _format_shop_log_lines(rows):
+    """/상점로그 · /사용내역 공용 출력 포맷."""
+    lines = []
+    for row in rows:
+        icon = "🛍️" if row["action"] == "구매" else "✅"
+        user_name = row["user_name"] or "(알 수 없음)"
+        # log_date 는 'YYYY-MM-DD HH:MM:SS' 형식. 연도와 초는 잘라 한 줄에 담습니다.
+        stamp = str(row["log_date"] or "")[5:16]
+
+        detail = f"📦 {row['item_name']} x{row['quantity']}"
+        if row["action"] == "구매" and row["price"] is not None:
+            detail += f" · 🅟{row['price']:,}"
+            if row["points_after"] is not None:
+                detail += f" → 잔액 🅟{row['points_after']:,}"
+
+        lines.append(f"{icon} {row['action']} | 👤 {user_name}")
+        lines.append(f"   ㄴ {detail} · 🕒 {stamp}")
+    return lines
 
 
 def _fetch_owned_items():
@@ -1320,6 +1403,16 @@ def handle_user_commands(chat: ChatContext):
                                     VALUES (?, ?, 1, ?)
                                 """, (user['user_id'], item['item_id'], now_time))
 
+                    _write_shop_log(
+                        cur, "구매",
+                        user['user_id'], user['name'],
+                        item['item_id'], item['item_name'], 1,
+                        price=item['price'],
+                        points_after=current_points - item['price'],
+                        processed_by=user['user_id'],
+                        log_date=now_time,
+                    )
+
                     conn.commit()
                     chat.reply(
                         f"🛍️ 구매 완료: [{item['item_name']}]\n결제 금액: 🅟{item['price']:,}\n남은 포인트: 🅟{current_points - item['price']:,}")
@@ -1557,12 +1650,13 @@ def handle_user_commands(chat: ChatContext):
                     cur.execute("DELETE FROM inventory WHERE id = ? AND quantity <= 0",
                                 (target['inv_id'],))
 
-                    cur.execute("""
-                                INSERT INTO item_usage_logs
-                                    (user_id, item_id, item_name, quantity, processed_by, processed_date)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                            """, (target['user_id'], target['item_id'], target['item_name'],
-                                  use_count, chat.sender.id, now_time))
+                    _write_shop_log(
+                        cur, "사용",
+                        target['user_id'], target['user_name'],
+                        target['item_id'], target['item_name'], use_count,
+                        processed_by=chat.sender.id,
+                        log_date=now_time,
+                    )
 
                     conn.commit()
 
@@ -1585,35 +1679,74 @@ def handle_user_commands(chat: ChatContext):
                     conn.close()
             return True
 
-        if cmd == "/사용내역":
+        # ─────────────────────────────
+        # 관리자 전용: 상점 활동 로그
+        # /구매 와 /사용처리 가 남긴 기록을 한 곳에서 조회합니다.
+        # /사용내역 은 사용 기록만 보는 단축 명령입니다.
+        # ─────────────────────────────
+        if cmd in ("/상점로그", "/사용내역"):
             if not is_admin(chat.sender.id):
                 return False
+
+            action_filter = "사용" if cmd == "/사용내역" else None
+            limit = SHOP_LOG_DEFAULT_LIMIT
+
+            for token in getattr(chat.message, "param", "").strip().split():
+                if token in SHOP_LOG_ACTIONS:
+                    action_filter = token
+                elif token.isdigit():
+                    limit = max(1, min(int(token), SHOP_LOG_MAX_LIMIT))
+                else:
+                    chat.reply(
+                        f"⚠️ 형식: {cmd} [구매|사용] [건수]\n"
+                        f"예: {cmd}\n"
+                        f"예: {cmd} 구매\n"
+                        f"예: {cmd} 사용 30\n"
+                        f"💡 건수는 최대 {SHOP_LOG_MAX_LIMIT}건까지입니다."
+                    )
+                    return True
 
             with DB_LOCK:
                 conn = get_db_conn()
                 cur = conn.cursor()
-                cur.execute("""
-                            SELECT log.item_name, log.quantity, log.processed_date,
-                                   u.name AS user_name
-                            FROM item_usage_logs log
-                            LEFT JOIN users u ON log.user_id = u.user_id
-                            ORDER BY log.id DESC
-                            LIMIT 15
-                        """)
+
+                if action_filter:
+                    cur.execute("""
+                                SELECT * FROM shop_logs
+                                WHERE action = ?
+                                ORDER BY id DESC
+                                LIMIT ?
+                            """, (action_filter, limit))
+                else:
+                    cur.execute("SELECT * FROM shop_logs ORDER BY id DESC LIMIT ?", (limit,))
                 logs = cur.fetchall()
+
+                cur.execute("""
+                            SELECT action, COUNT(*) AS count, SUM(quantity) AS total
+                            FROM shop_logs
+                            GROUP BY action
+                        """)
+                summary = {row['action']: row for row in cur.fetchall()}
                 conn.close()
 
             if not logs:
-                chat.reply("📭 아직 사용 처리 내역이 없습니다.")
+                target_text = f"'{action_filter}' " if action_filter else ""
+                chat.reply(f"📭 {target_text}상점 로그가 없습니다.")
                 return True
 
-            msg_lines = ["🧾 [ 최근 사용 처리 내역 TOP 15 ]", "────────"]
-            for row in logs:
-                user_name = row['user_name'] or "(삭제된 유저)"
-                msg_lines.append(f"👤 {user_name} - 📦 {row['item_name']} x{row['quantity']}")
-                msg_lines.append(f"   ㄴ 🕒 {row['processed_date']}")
-
+            title = f"🧾 [ 상점 로그 - {action_filter} ]" if action_filter else "🧾 [ 상점 로그 ]"
+            msg_lines = [title, "────────"]
+            msg_lines.extend(_format_shop_log_lines(logs))
             msg_lines.append("────────")
+
+            buy = summary.get("구매")
+            use = summary.get("사용")
+            msg_lines.append(
+                f"📊 누적 구매 {buy['count'] if buy else 0}건 / "
+                f"사용 처리 {use['count'] if use else 0}건"
+            )
+            msg_lines.append(f"💡 최신 {len(logs)}건 표시 · {cmd} [구매|사용] [건수]")
+
             chat.reply("\n".join(msg_lines))
             return True
 
