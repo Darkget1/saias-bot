@@ -147,6 +147,22 @@ def init_db():
                     )
                 """)
 
+        # ✅ 아이템 사용 처리 로그 테이블
+        # 관리자가 /사용처리 로 차감한 기록을 남깁니다.
+        # item_name을 함께 저장하는 이유: /상점삭제 로 items에서 사라져도 내역은 남아야 합니다.
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS item_usage_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        item_id INTEGER,
+                        item_name TEXT,
+                        quantity INTEGER,
+                        processed_by INTEGER,
+                        processed_date TEXT,
+                        FOREIGN KEY(user_id) REFERENCES users(user_id)
+                    )
+                """)
+
         # ✅ 관리자 테이블
         # .env에 들어있는 초기 관리자와 명령어로 추가한 관리자를 모두 저장합니다.
         cur.execute("""
@@ -457,6 +473,36 @@ def _latest_open_chat_nickname(user_id, room_id=None):
             return nickname
 
     return None
+
+
+def _fetch_owned_items():
+    """
+    보유 수량이 남아있는 (유저 × 아이템) 목록.
+
+    /구매목록 과 /사용처리 가 이 함수를 공유해야 번호가 서로 어긋나지 않습니다.
+    items는 LEFT JOIN 입니다. /상점삭제 로 아이템이 지워져도 인벤토리 행은 남기 때문에,
+    INNER JOIN이면 그 행이 목록에서 사라져 영영 정리할 수 없게 됩니다.
+    """
+    with DB_LOCK:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+                    SELECT inv.id        AS inv_id,
+                           inv.user_id   AS user_id,
+                           inv.item_id   AS item_id,
+                           inv.quantity  AS quantity,
+                           u.name        AS user_name,
+                           COALESCE(i.item_name, '(삭제된 아이템 #' || inv.item_id || ')') AS item_name
+                    FROM inventory inv
+                    JOIN users u ON inv.user_id = u.user_id
+                    LEFT JOIN items i ON inv.item_id = i.item_id
+                    WHERE inv.quantity > 0
+                    ORDER BY u.name ASC, item_name ASC
+                """)
+        rows = cur.fetchall()
+        conn.close()
+
+    return rows
 
 
 def _get_or_create_user(chat: ChatContext):
@@ -1398,6 +1444,177 @@ def handle_user_commands(chat: ChatContext):
 
             info_msg.append("────────")
             chat.reply("\n".join(info_msg))
+            return True
+
+        # ─────────────────────────────
+        # 관리자 전용: 구매 아이템 사용 처리
+        # /구매목록 으로 번호를 확인하고 /사용처리 [번호] [개수] 로 차감합니다.
+        # ─────────────────────────────
+        if cmd == "/구매목록":
+            if not is_admin(chat.sender.id):
+                return False
+
+            rows = _fetch_owned_items()
+
+            if not rows:
+                chat.reply("📭 사용 처리할 보유 아이템이 없습니다.")
+                return True
+
+            msg_lines = ["📦 [ 구매 아이템 목록 ]", "────────"]
+            for i, row in enumerate(rows, start=1):
+                # 수량이 1이면 굳이 x1 을 붙이지 않습니다.
+                qty_text = f" x{row['quantity']}" if row['quantity'] > 1 else ""
+                msg_lines.append(f"{i}) {row['item_name']}{qty_text} - 👤 {row['user_name']}")
+
+            msg_lines.append("────────")
+            msg_lines.append("💡 사용 처리: /사용처리 [번호]")
+            msg_lines.append("예시: /사용처리 1        (1개 처리)")
+            msg_lines.append("      /사용처리 1 2      (2개 처리)")
+            msg_lines.append("      /사용처리 1 전부   (전량 처리)")
+
+            chat.reply("\n".join(msg_lines))
+            return True
+
+        if cmd == "/사용처리":
+            if not is_admin(chat.sender.id):
+                return False
+
+            param = getattr(chat.message, "param", "").strip()
+            parts = param.split()
+
+            if not parts or not parts[0].isdigit():
+                chat.reply(
+                    "⚠️ 사용 처리할 항목의 '번호'를 입력해주세요.\n"
+                    "예: /사용처리 1\n"
+                    "예: /사용처리 1 2   (2개 처리)\n"
+                    "예: /사용처리 1 전부 (전량 처리)\n"
+                    "💡 번호는 /구매목록 에서 확인하세요."
+                )
+                return True
+
+            target_idx = int(parts[0])
+            count_text = parts[1] if len(parts) >= 2 else "1"
+            use_all = count_text in ("전부", "모두", "all", "ALL")
+
+            if not use_all and not count_text.isdigit():
+                chat.reply(
+                    "⚠️ 개수는 숫자 또는 '전부' 로 입력해주세요.\n"
+                    "예: /사용처리 1 2\n"
+                    "예: /사용처리 1 전부"
+                )
+                return True
+
+            rows = _fetch_owned_items()
+
+            if target_idx < 1 or target_idx > len(rows):
+                chat.reply(
+                    f"⚠️ 잘못된 번호입니다. (1~{len(rows)} 사이 입력)\n"
+                    f"/구매목록 을 다시 확인해주세요."
+                )
+                return True
+
+            target = rows[target_idx - 1]
+            # '전부' 는 목록에 찍힌 보유 수량 전체를 뜻하므로 target 확정 이후에 계산합니다.
+            use_count = target['quantity'] if use_all else int(count_text)
+
+            if use_count < 1:
+                chat.reply("⚠️ 개수는 1 이상이어야 합니다.")
+                return True
+
+            if use_count > target['quantity']:
+                chat.reply(
+                    f"🚫 보유 수량보다 많이 처리할 수 없습니다.\n"
+                    f"👤 {target['user_name']} / 📦 {target['item_name']}\n"
+                    f"보유: {target['quantity']}개 / 요청: {use_count}개"
+                )
+                return True
+
+            now_time = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+            with DB_LOCK:
+                conn = get_db_conn()
+                cur = conn.cursor()
+
+                try:
+                    # quantity >= ? 조건으로 목록 조회 이후 수량이 바뀐 경우를 걸러냅니다.
+                    cur.execute("""
+                                UPDATE inventory
+                                SET quantity = quantity - ?
+                                WHERE id = ? AND quantity >= ?
+                            """, (use_count, target['inv_id'], use_count))
+
+                    if cur.rowcount == 0:
+                        conn.rollback()
+                        chat.reply(
+                            "⚠️ 처리 도중 보유 수량이 변경되었습니다.\n"
+                            "/구매목록 을 다시 확인해주세요."
+                        )
+                        conn.close()
+                        return True
+
+                    # 남은 수량이 0이면 인벤토리에서 행 자체를 제거합니다.
+                    # 기록은 item_usage_logs 에 남으므로 /사용내역 으로 추적 가능합니다.
+                    cur.execute("DELETE FROM inventory WHERE id = ? AND quantity <= 0",
+                                (target['inv_id'],))
+
+                    cur.execute("""
+                                INSERT INTO item_usage_logs
+                                    (user_id, item_id, item_name, quantity, processed_by, processed_date)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            """, (target['user_id'], target['item_id'], target['item_name'],
+                                  use_count, chat.sender.id, now_time))
+
+                    conn.commit()
+
+                    remain = target['quantity'] - use_count
+                    remain_text = f"📉 남은 수량: {remain}개" if remain > 0 else "🗑️ 목록에서 제거되었습니다."
+
+                    chat.reply(
+                        f"✅ 사용 처리 완료\n"
+                        f"────────\n"
+                        f"📦 {target['item_name']} x{use_count}\n"
+                        f"👤 {target['user_name']}\n"
+                        f"{remain_text}\n"
+                        f"🕒 {now_time}"
+                    )
+                except Exception as e:
+                    conn.rollback()
+                    chat.reply("❌ 사용 처리 중 오류가 발생했습니다.")
+                    print(f"Item Usage Error: {e}")
+                finally:
+                    conn.close()
+            return True
+
+        if cmd == "/사용내역":
+            if not is_admin(chat.sender.id):
+                return False
+
+            with DB_LOCK:
+                conn = get_db_conn()
+                cur = conn.cursor()
+                cur.execute("""
+                            SELECT log.item_name, log.quantity, log.processed_date,
+                                   u.name AS user_name
+                            FROM item_usage_logs log
+                            LEFT JOIN users u ON log.user_id = u.user_id
+                            ORDER BY log.id DESC
+                            LIMIT 15
+                        """)
+                logs = cur.fetchall()
+                conn.close()
+
+            if not logs:
+                chat.reply("📭 아직 사용 처리 내역이 없습니다.")
+                return True
+
+            msg_lines = ["🧾 [ 최근 사용 처리 내역 TOP 15 ]", "────────"]
+            for row in logs:
+                user_name = row['user_name'] or "(삭제된 유저)"
+                msg_lines.append(f"👤 {user_name} - 📦 {row['item_name']} x{row['quantity']}")
+                msg_lines.append(f"   ㄴ 🕒 {row['processed_date']}")
+
+            msg_lines.append("────────")
+            chat.reply("\n".join(msg_lines))
             return True
 
         if cmd == "/유저목록":
