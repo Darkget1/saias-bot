@@ -369,6 +369,12 @@ LOTTO_FIRST_PRIZE = 300
 LOTTO_SECOND_PRIZE = 150
 USE_LEGACY_PROBABILITY_LOTTO_DRAW = False
 
+# 티켓 1장이 2등에 당첨될 목표 확률.
+# 발행 번호 범위(111~222)를 그대로 둔 채 당첨번호 추첨만 조작해 이 값에 맞춥니다.
+# 범위를 손대지 않는 이유: 유저가 받는 번호의 생김새가 바뀌지 않아야 하기 때문입니다.
+# None 을 넣으면 조작 없이 균등 추첨(2등 약 13.9%)으로 돌아갑니다.
+LOTTO_TARGET_SECOND_RATE = 0.05
+
 
 def _format_lotto_number(number):
     return f"{int(number):03d}"
@@ -411,11 +417,84 @@ def _pick_legacy_probability_lotto_number(tickets):
     return _generate_lotto_number()
 
 
+def _lotto_candidate_rates(ticket_numbers):
+    """
+    후보 당첨번호(111~222) 각각에 대해 이번 티켓 풀의 1등/2등 당첨 비율을 계산합니다.
+
+    당첨번호는 하나뿐이므로 그 하나를 무엇으로 고르느냐가 당첨자 수를 전부 결정합니다.
+    즉 후보별 결과를 미리 알 수 있고, 그래서 확률 통제가 가능합니다.
+    """
+    total = len(ticket_numbers)
+    rates = []
+
+    for candidate in range(LOTTO_MIN_NUMBER, LOTTO_MAX_NUMBER + 1):
+        candidate_text = _format_lotto_number(candidate)
+        first = 0
+        second = 0
+
+        for ticket_number in ticket_numbers:
+            match_cnt = _count_lotto_digit_matches(ticket_number, candidate_text)
+            if match_cnt == 3:
+                first += 1
+            elif match_cnt == 2:
+                second += 1
+
+        rates.append((candidate_text, first / total, second / total))
+
+    return rates
+
+
+def _pick_controlled_lotto_number(tickets):
+    """
+    2등 당첨률이 LOTTO_TARGET_SECOND_RATE 에 수렴하도록 당첨번호를 고릅니다.
+
+    후보를 '목표 이하'와 '목표 초과' 두 무리로 나누고,
+    두 무리의 평균 당첨률이 정확히 목표가 되는 비율 alpha 로 무리를 먼저 뽑습니다.
+    무리 안에서는 균등 추첨하므로 당첨번호가 한 값에 고정되지 않습니다.
+    """
+    numbers = [
+        _format_lotto_number(t['numbers'])
+        for t in tickets
+        if _is_valid_lotto_number(t['numbers'])
+    ]
+    if not numbers:
+        return _generate_lotto_number()
+
+    target = LOTTO_TARGET_SECOND_RATE
+    rates = _lotto_candidate_rates(numbers)
+
+    low = [r for r in rates if r[2] <= target]
+    high = [r for r in rates if r[2] > target]
+
+    # 어떤 번호를 골라도 목표 이하면 그냥 균등 추첨해도 목표를 넘지 않습니다.
+    if not high:
+        return random.choice(rates)[0]
+
+    # 반대로 전부 목표 초과면 가장 당첨자가 적은 쪽으로 붙입니다.
+    if not low:
+        floor = min(r[2] for r in rates)
+        return random.choice([r for r in rates if r[2] == floor])[0]
+
+    mean_low = sum(r[2] for r in low) / len(low)
+    mean_high = sum(r[2] for r in high) / len(high)
+    if mean_high <= mean_low:
+        return random.choice(low)[0]
+
+    alpha = (target - mean_low) / (mean_high - mean_low)
+    alpha = min(max(alpha, 0.0), 1.0)
+
+    group = high if random.random() < alpha else low
+    return random.choice(group)[0]
+
+
 def _pick_lotto_winning_number(tickets):
     if USE_LEGACY_PROBABILITY_LOTTO_DRAW:
         return _pick_legacy_probability_lotto_number(tickets)
 
-    return _generate_lotto_number()
+    if LOTTO_TARGET_SECOND_RATE is None:
+        return _generate_lotto_number()
+
+    return _pick_controlled_lotto_number(tickets)
 
 
 def _safe_debug_text(value, limit=120):
