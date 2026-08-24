@@ -201,6 +201,41 @@ def init_db():
                         ORDER BY old.id ASC
                     """)
 
+        # ✅ 복권 추첨 회차 로그
+        # 당첨자가 없어도 1행 남깁니다. 당첨번호는 지금까지 채팅으로만 흘러가고
+        # 어디에도 남지 않아, 지난 회차를 되짚을 방법이 없었습니다.
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS lotto_draws (
+                        draw_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        room_id TEXT,
+                        winning_number TEXT,
+                        ticket_count INTEGER,
+                        invalid_count INTEGER,
+                        first_count INTEGER,
+                        second_count INTEGER,
+                        total_payout INTEGER,
+                        draw_date TEXT
+                    )
+                """)
+
+        # ✅ 복권 당첨자 로그
+        # user_name / ticket_number 를 함께 저장하는 이유는 shop_logs 와 같습니다.
+        # 닉네임이 바뀌거나 /유저삭제 된 뒤에도 "누가 무엇으로 탔는지"가 읽혀야 합니다.
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS lotto_wins (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        draw_id INTEGER,
+                        user_id INTEGER,
+                        user_name TEXT,
+                        ticket_number TEXT,
+                        win_rank INTEGER,
+                        prize INTEGER,
+                        draw_date TEXT,
+                        FOREIGN KEY(draw_id) REFERENCES lotto_draws(draw_id)
+                    )
+                """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_lotto_wins_draw ON lotto_wins(draw_id)")
+
         # ✅ 관리자 테이블
         # .env에 들어있는 초기 관리자와 명령어로 추가한 관리자를 모두 저장합니다.
         cur.execute("""
@@ -485,6 +520,42 @@ def _pick_controlled_lotto_number(tickets):
 
     group = high if random.random() < alpha else low
     return random.choice(group)[0]
+
+
+LOTTO_LOG_DEFAULT_LIMIT = 10
+LOTTO_LOG_MAX_LIMIT = 30
+
+
+def _write_lotto_log(cur, room_id, winning_number, ticket_count, invalid_count, winner_rows):
+    """
+    추첨 회차 1건과 그 회차의 당첨자들을 기록합니다.
+
+    당첨자가 없어도 회차 행은 남깁니다. "그날 당첨번호가 뭐였나"는
+    당첨자 유무와 무관하게 답할 수 있어야 하기 때문입니다.
+    호출부의 트랜잭션에 얹히므로 여기서 commit 하지 않습니다.
+    """
+    draw_date = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    total_payout = sum(row[4] for row in winner_rows)
+    first_count = sum(1 for row in winner_rows if row[3] == 1)
+    second_count = sum(1 for row in winner_rows if row[3] == 2)
+
+    cur.execute("""
+                INSERT INTO lotto_draws
+                    (room_id, winning_number, ticket_count, invalid_count,
+                     first_count, second_count, total_payout, draw_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (room_id, winning_number, ticket_count, invalid_count,
+                  first_count, second_count, total_payout, draw_date))
+    draw_id = cur.lastrowid
+
+    for user_id, user_name, ticket_number, win_rank, prize in winner_rows:
+        cur.execute("""
+                    INSERT INTO lotto_wins
+                        (draw_id, user_id, user_name, ticket_number, win_rank, prize, draw_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (draw_id, user_id, user_name, ticket_number, win_rank, prize, draw_date))
+
+    return draw_id
 
 
 def _pick_lotto_winning_number(tickets):
@@ -875,6 +946,8 @@ def execute_lotto_draw(bot):
             w2_list = []
             invalid_ticket_count = 0
 
+            winner_rows = []
+
             for t in tickets:
                 u_num = t['numbers']
                 if not _is_valid_lotto_number(u_num):
@@ -886,9 +959,15 @@ def execute_lotto_draw(bot):
                 if match_cnt == 3:
                     w1_list.append(t['name'])
                     cur.execute("UPDATE users SET points=points+? WHERE user_id=?", (LOTTO_FIRST_PRIZE, t['user_id']))
+                    winner_rows.append((t['user_id'], t['name'], _format_lotto_number(u_num), 1, LOTTO_FIRST_PRIZE))
                 elif match_cnt == 2:
                     w2_list.append(t['name'])
                     cur.execute("UPDATE users SET points=points+? WHERE user_id=?", (LOTTO_SECOND_PRIZE, t['user_id']))
+                    winner_rows.append((t['user_id'], t['name'], _format_lotto_number(u_num), 2, LOTTO_SECOND_PRIZE))
+
+            _write_lotto_log(cur, rid, winning_number,
+                             len(tickets) - invalid_ticket_count, invalid_ticket_count,
+                             winner_rows)
 
             # 4. 결과 메시지 구성 (요청하신 형식)
             msg_lines = [
@@ -1426,6 +1505,104 @@ def handle_user_commands(chat: ChatContext):
                 f"2등 상금: {LOTTO_SECOND_PRIZE}P\n\n"
                 f"현재 {wait_cnt}명이 참여 중입니다."
             )
+            return True
+
+        # ─────────────────────────────
+        # 관리자 전용: 복권 추첨/당첨 로그
+        # 당첨번호는 지금까지 채팅으로만 방송되고 어디에도 남지 않았습니다.
+        # ─────────────────────────────
+        if cmd == "/복권로그":
+            if not is_admin(chat.sender.id):
+                return False
+
+            winners_only = False
+            limit = LOTTO_LOG_DEFAULT_LIMIT
+
+            for token in _command_param(chat).split():
+                if token in ("당첨", "당첨자"):
+                    winners_only = True
+                elif token.isdigit():
+                    limit = max(1, min(int(token), LOTTO_LOG_MAX_LIMIT))
+                else:
+                    chat.reply(
+                        "⚠️ 형식: /복권로그 [당첨] [건수]\n"
+                        "예: /복권로그\n"
+                        "예: /복권로그 당첨\n"
+                        "예: /복권로그 당첨 20\n"
+                        f"💡 건수는 최대 {LOTTO_LOG_MAX_LIMIT}건까지입니다."
+                    )
+                    return True
+
+            with DB_LOCK:
+                conn = get_db_conn()
+                cur = conn.cursor()
+
+                if winners_only:
+                    cur.execute("""
+                                SELECT user_name, ticket_number, win_rank, prize, draw_date
+                                FROM lotto_wins
+                                ORDER BY id DESC
+                                LIMIT ?
+                            """, (limit,))
+                else:
+                    cur.execute("""
+                                SELECT winning_number, ticket_count, invalid_count,
+                                       first_count, second_count, total_payout, draw_date
+                                FROM lotto_draws
+                                ORDER BY draw_id DESC
+                                LIMIT ?
+                            """, (limit,))
+                rows = cur.fetchall()
+
+                cur.execute("""
+                            SELECT COUNT(*) AS draws,
+                                   COALESCE(SUM(first_count), 0)  AS first_total,
+                                   COALESCE(SUM(second_count), 0) AS second_total,
+                                   COALESCE(SUM(total_payout), 0) AS payout
+                            FROM lotto_draws
+                        """)
+                summary = cur.fetchone()
+                conn.close()
+
+            if not rows:
+                chat.reply(
+                    "📭 복권 기록이 없습니다.\n"
+                    "(추첨은 매일 오전 6시에 진행됩니다)"
+                )
+                return True
+
+            if winners_only:
+                msg_lines = ["🎰 [ 복권 당첨자 내역 ]", "────────"]
+                for row in rows:
+                    icon = "🥇" if row["win_rank"] == 1 else "🥈"
+                    stamp = str(row["draw_date"] or "")[5:16]
+                    msg_lines.append(f"{icon} {row['win_rank']}등 | 👤 {row['user_name'] or '(알 수 없음)'}")
+                    msg_lines.append(f"   ㄴ 번호 {row['ticket_number']} · 🅟{row['prize']:,} · 🕒 {stamp}")
+            else:
+                msg_lines = ["🎰 [ 복권 추첨 내역 ]", "────────"]
+                for row in rows:
+                    stamp = str(row["draw_date"] or "")[5:16]
+                    msg_lines.append(f"🎯 당첨번호 {row['winning_number']} · {row['ticket_count']}명 참여")
+
+                    if row["first_count"] or row["second_count"]:
+                        detail = f"🥇{row['first_count']}명 🥈{row['second_count']}명 · 🅟{row['total_payout']:,}"
+                    else:
+                        detail = "당첨자 없음"
+                    if row["invalid_count"]:
+                        detail += f" · 탈락 {row['invalid_count']}건"
+
+                    msg_lines.append(f"   ㄴ {detail} · 🕒 {stamp}")
+
+            msg_lines.append("────────")
+            msg_lines.append(
+                f"📊 누적 {summary['draws']}회차 · "
+                f"1등 {summary['first_total']}명 / 2등 {summary['second_total']}명"
+            )
+            msg_lines.append(f"💰 총 지급 🅟{summary['payout']:,}")
+            if not winners_only:
+                msg_lines.append("💡 /복권로그 당첨 [건수] 로 당첨자 명단")
+
+            chat.reply("\n".join(msg_lines))
             return True
 
         if cmd == "/상점":
