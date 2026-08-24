@@ -2,6 +2,7 @@ import sqlite3
 import random
 import threading
 import time
+import traceback
 from datetime import datetime, date, timedelta
 import pytz
 from iris import ChatContext, PyKV
@@ -522,8 +523,25 @@ def _pick_controlled_lotto_number(tickets):
     return random.choice(group)[0]
 
 
+# 스케줄러 생존 상태. /복권상태 로 조회합니다.
+# 데몬 스레드가 조용히 죽으면 추첨이 영구 정지하는데 지금까지는 알 방법이 없었습니다.
+LOTTO_SCHEDULER_STATE = {
+    "started_at": None,
+    "next_run": None,
+    "last_run": None,
+    "last_result": None,
+    "last_error": None,
+    "run_count": 0,
+    "error_count": 0,
+    "alive": False,
+}
+
 LOTTO_LOG_DEFAULT_LIMIT = 10
 LOTTO_LOG_MAX_LIMIT = 30
+
+
+def _lotto_now_text():
+    return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _write_lotto_log(cur, room_id, winning_number, ticket_count, invalid_count, winner_rows):
@@ -892,23 +910,51 @@ def start_lotto_scheduler(bot):
     start_abyss_hole_tracker(bot, safe_send_message, get_db_conn, DB_LOCK, KST)
 
     def run():
+        LOTTO_SCHEDULER_STATE["started_at"] = _lotto_now_text()
+        LOTTO_SCHEDULER_STATE["alive"] = True
+
         while True:
-            now = datetime.now(KST)
+            # 대기 시간 계산까지 try 안에 둡니다.
+            # 이 스레드가 죽으면 봇은 멀쩡히 돌면서 추첨만 영구 정지하기 때문입니다.
+            try:
+                now = datetime.now(KST)
 
-            # ✅ 테스트용: 1분 뒤 실행 (테스트 끝나면 주석 처리)
-            # target = now + timedelta(minutes=1)
+                # ✅ 테스트용: 1분 뒤 실행 (테스트 끝나면 주석 처리)
+                # target = now + timedelta(minutes=1)
 
-            # [운영용] 매일 오전 6시
-            target = now.replace(hour=6, minute=0, second=0, microsecond=0)
-            if now >= target:
-                target += timedelta(days=1)
+                # [운영용] 매일 오전 6시
+                target = now.replace(hour=6, minute=0, second=0, microsecond=0)
+                if now >= target:
+                    target += timedelta(days=1)
 
-            wait_sec = (target - now).total_seconds()
-            print(f"[시스템] 다음 추첨({target.strftime('%H:%M:%S')})까지 {wait_sec:.1f}초 대기...")
+                LOTTO_SCHEDULER_STATE["next_run"] = target.strftime("%Y-%m-%d %H:%M:%S")
+                wait_sec = (target - now).total_seconds()
+                print(f"[시스템] 다음 추첨({target.strftime('%H:%M:%S')})까지 {wait_sec:.1f}초 대기...")
 
-            time.sleep(wait_sec)
+                time.sleep(wait_sec)
+            except Exception as e:
+                LOTTO_SCHEDULER_STATE["error_count"] += 1
+                LOTTO_SCHEDULER_STATE["last_error"] = f"대기 계산 실패 {type(e).__name__}: {e}"
+                print(f"[복권] 대기 계산 실패: {type(e).__name__}: {e}")
+                traceback.print_exc()
+                time.sleep(60)
+                continue
 
-            execute_lotto_draw(bot)
+            try:
+                execute_lotto_draw(bot)
+                LOTTO_SCHEDULER_STATE["run_count"] += 1
+                LOTTO_SCHEDULER_STATE["last_result"] = "성공"
+                LOTTO_SCHEDULER_STATE["last_error"] = None
+            except Exception as e:
+                # 한 회차가 실패해도 스레드는 살려둡니다. 죽으면 내일도 안 돕니다.
+                LOTTO_SCHEDULER_STATE["error_count"] += 1
+                LOTTO_SCHEDULER_STATE["last_result"] = "실패"
+                LOTTO_SCHEDULER_STATE["last_error"] = f"{type(e).__name__}: {e}"
+                print(f"[복권] 추첨 실패: {type(e).__name__}: {e}")
+                traceback.print_exc()
+            finally:
+                LOTTO_SCHEDULER_STATE["last_run"] = _lotto_now_text()
+
             time.sleep(5)
 
     threading.Thread(target=run, daemon=True).start()
@@ -917,99 +963,110 @@ def start_lotto_scheduler(bot):
 def execute_lotto_draw(bot):
     with DB_LOCK:
         conn = get_db_conn()
-        cur = conn.cursor()
 
-        cur.execute("SELECT DISTINCT room_id FROM lotto WHERE is_drawn=0")
-        rooms = [r['room_id'] for r in cur.fetchall() if r['room_id']]
+        # 추첨 도중 실패하면 포인트 지급과 로그가 함께 롤백되어야 합니다.
+        # 예외는 삼키지 않고 다시 올려, 스케줄러가 실패를 기록하게 합니다.
+        try:
+            cur = conn.cursor()
 
-        if not rooms:
+            cur.execute("SELECT DISTINCT room_id FROM lotto WHERE is_drawn=0")
+            rooms = [r['room_id'] for r in cur.fetchall() if r['room_id']]
 
-            conn.close()
-            return
+            # room_id 가 없는 티켓은 결과를 방송할 곳이 없어 추첨에서 빠집니다.
+            # 그대로 두면 is_drawn=0 으로 남아 그 유저가 새 복권을 받지 못하므로
+            # 정산은 하되, 조용히 사라지지 않도록 흔적을 남깁니다.
+            cur.execute("SELECT COUNT(*) AS count FROM lotto"
+                        " WHERE is_drawn=0 AND (room_id IS NULL OR room_id = '')")
+            orphan_count = cur.fetchone()["count"]
+            if orphan_count:
+                print(f"[복권] 방 정보 없는 티켓 {orphan_count}건은 방송할 곳이 없어"
+                      f" 추첨 없이 정산 처리합니다.")
 
+            for rid in rooms:
+                # 해당 방의 티켓 정보 가져오기
+                cur.execute("""
+                    SELECT l.user_id, l.numbers, u.name 
+                    FROM lotto l 
+                    JOIN users u ON l.user_id = u.user_id 
+                    WHERE l.room_id=? AND l.is_drawn=0
+                """, (rid,))
 
+                tickets = cur.fetchall()
+                winning_number = _pick_lotto_winning_number(tickets)
 
-        for rid in rooms:
-            # 해당 방의 티켓 정보 가져오기
-            cur.execute("""
-                SELECT l.user_id, l.numbers, u.name 
-                FROM lotto l 
-                JOIN users u ON l.user_id = u.user_id 
-                WHERE l.room_id=? AND l.is_drawn=0
-            """, (rid,))
+                # 3. 채점 및 포인트 지급
+                w1_list = []
+                w2_list = []
+                invalid_ticket_count = 0
 
-            tickets = cur.fetchall()
-            winning_number = _pick_lotto_winning_number(tickets)
+                winner_rows = []
 
-            # 3. 채점 및 포인트 지급
-            w1_list = []
-            w2_list = []
-            invalid_ticket_count = 0
+                for t in tickets:
+                    u_num = t['numbers']
+                    if not _is_valid_lotto_number(u_num):
+                        invalid_ticket_count += 1
+                        continue
 
-            winner_rows = []
+                    match_cnt = _count_lotto_digit_matches(u_num, winning_number)
 
-            for t in tickets:
-                u_num = t['numbers']
-                if not _is_valid_lotto_number(u_num):
-                    invalid_ticket_count += 1
-                    continue
+                    if match_cnt == 3:
+                        w1_list.append(t['name'])
+                        cur.execute("UPDATE users SET points=points+? WHERE user_id=?", (LOTTO_FIRST_PRIZE, t['user_id']))
+                        winner_rows.append((t['user_id'], t['name'], _format_lotto_number(u_num), 1, LOTTO_FIRST_PRIZE))
+                    elif match_cnt == 2:
+                        w2_list.append(t['name'])
+                        cur.execute("UPDATE users SET points=points+? WHERE user_id=?", (LOTTO_SECOND_PRIZE, t['user_id']))
+                        winner_rows.append((t['user_id'], t['name'], _format_lotto_number(u_num), 2, LOTTO_SECOND_PRIZE))
 
-                match_cnt = _count_lotto_digit_matches(u_num, winning_number)
+                _write_lotto_log(cur, rid, winning_number,
+                                 len(tickets) - invalid_ticket_count, invalid_ticket_count,
+                                 winner_rows)
 
-                if match_cnt == 3:
-                    w1_list.append(t['name'])
-                    cur.execute("UPDATE users SET points=points+? WHERE user_id=?", (LOTTO_FIRST_PRIZE, t['user_id']))
-                    winner_rows.append((t['user_id'], t['name'], _format_lotto_number(u_num), 1, LOTTO_FIRST_PRIZE))
-                elif match_cnt == 2:
-                    w2_list.append(t['name'])
-                    cur.execute("UPDATE users SET points=points+? WHERE user_id=?", (LOTTO_SECOND_PRIZE, t['user_id']))
-                    winner_rows.append((t['user_id'], t['name'], _format_lotto_number(u_num), 2, LOTTO_SECOND_PRIZE))
+                # 4. 결과 메시지 구성 (요청하신 형식)
+                msg_lines = [
+                    f"당첨번호 : {winning_number}",
+                    "",
+                    "[ 당첨자 명단 ]",
+                    ""
+                ]
 
-            _write_lotto_log(cur, rid, winning_number,
-                             len(tickets) - invalid_ticket_count, invalid_ticket_count,
-                             winner_rows)
+                if w1_list or w2_list:
+                    if w1_list:
+                        msg_lines.append("* 1등 *")
+                        for name in w1_list:
+                            msg_lines.append(f"🎉 {name}")
+                        msg_lines.append("") # 섹션 간 공백
 
-            # 4. 결과 메시지 구성 (요청하신 형식)
-            msg_lines = [
-                f"당첨번호 : {winning_number}",
-                "",
-                "[ 당첨자 명단 ]",
-                ""
-            ]
+                    if w2_list:
+                        msg_lines.append("* 2등 *")
+                        for name in w2_list:
+                            msg_lines.append(f"• {name}")
+                        msg_lines.append("")
 
-            if w1_list or w2_list:
-                if w1_list:
-                    msg_lines.append("* 1등 *")
-                    for name in w1_list:
-                        msg_lines.append(f"🎉 {name}")
-                    msg_lines.append("") # 섹션 간 공백
-
-                if w2_list:
-                    msg_lines.append("* 2등 *")
-                    for name in w2_list:
-                        msg_lines.append(f"• {name}")
                     msg_lines.append("")
+                    msg_lines.append("축하합니다!")
+                    msg_lines.append(f"1등 당첨자 : 🅟{LOTTO_FIRST_PRIZE}")
+                    msg_lines.append(f"2등 당첨자 : 🅟{LOTTO_SECOND_PRIZE}")
+                else:
+                    msg_lines.append(f"행운의 복권 {len(tickets)}명 추첨 결과")
+                    msg_lines.append("────────")
+                    msg_lines.append("'푸헤헤헤. 다음 기회에' 로 ")
 
-                msg_lines.append("")
-                msg_lines.append("축하합니다!")
-                msg_lines.append(f"1등 당첨자 : 🅟{LOTTO_FIRST_PRIZE}")
-                msg_lines.append(f"2등 당첨자 : 🅟{LOTTO_SECOND_PRIZE}")
-            else:
-                msg_lines.append(f"행운의 복권 {len(tickets)}명 추첨 결과")
-                msg_lines.append("────────")
-                msg_lines.append("'푸헤헤헤. 다음 기회에' 로 ")
+                if invalid_ticket_count:
+                    msg_lines.append("")
+                    msg_lines.append(f"범위 밖 복권 {invalid_ticket_count}건은 자동 탈락 처리되었습니다.")
 
-            if invalid_ticket_count:
-                msg_lines.append("")
-                msg_lines.append(f"범위 밖 복권 {invalid_ticket_count}건은 자동 탈락 처리되었습니다.")
+                # 최종 메시지 전송
+                safe_send_message(bot, rid, "\n".join(msg_lines))
 
-            # 최종 메시지 전송
-            safe_send_message(bot, rid, "\n".join(msg_lines))
-
-        # 정산 완료 처리
-        cur.execute("UPDATE lotto SET is_drawn=1 WHERE is_drawn=0")
-        conn.commit()
-        conn.close()
+            # 정산 완료 처리
+            cur.execute("UPDATE lotto SET is_drawn=1 WHERE is_drawn=0")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 execute_probability_draw = execute_lotto_draw
@@ -1601,6 +1658,88 @@ def handle_user_commands(chat: ChatContext):
             msg_lines.append(f"💰 총 지급 🅟{summary['payout']:,}")
             if not winners_only:
                 msg_lines.append("💡 /복권로그 당첨 [건수] 로 당첨자 명단")
+
+            chat.reply("\n".join(msg_lines))
+            return True
+
+        # ─────────────────────────────
+        # 관리자 전용: 복권 스케줄러 생존 확인
+        # 추첨 스레드는 데몬이라 죽어도 봇은 멀쩡히 돕니다. 눈으로 볼 수단이 필요합니다.
+        # ─────────────────────────────
+        if cmd == "/복권상태":
+            if not is_admin(chat.sender.id):
+                return False
+
+            state = LOTTO_SCHEDULER_STATE
+            now = datetime.now(KST)
+
+            with DB_LOCK:
+                conn = get_db_conn()
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) AS count FROM lotto WHERE is_drawn=0")
+                pending = cur.fetchone()["count"]
+                cur.execute("""
+                            SELECT winning_number, ticket_count, draw_date
+                            FROM lotto_draws
+                            ORDER BY draw_id DESC
+                            LIMIT 1
+                        """)
+                last_draw = cur.fetchone()
+                conn.close()
+
+            if not state["alive"]:
+                head = "🔴 스케줄러가 기동되지 않았습니다"
+            elif state["last_result"] == "실패":
+                head = "🟠 마지막 추첨이 실패했습니다"
+            else:
+                head = "🟢 정상 가동 중"
+
+            msg_lines = ["🩺 [ 복권 스케줄러 상태 ]", "────────", head, ""]
+            msg_lines.append(f"🕒 봇 기동: {state['started_at'] or '-'}")
+
+            next_run = state["next_run"]
+            if next_run:
+                try:
+                    target = KST.localize(datetime.strptime(next_run, "%Y-%m-%d %H:%M:%S"))
+                    left = int((target - now).total_seconds())
+                    left_text = f" ({left // 3600}시간 {left % 3600 // 60}분 후)" if left > 0 else " (지났음)"
+                except Exception:
+                    left_text = ""
+                msg_lines.append(f"⏭️ 다음 추첨: {next_run}{left_text}")
+            else:
+                msg_lines.append("⏭️ 다음 추첨: 대기 시각 미설정")
+
+            msg_lines.append("────────")
+            msg_lines.append(f"📊 실행 {state['run_count']}회 / 실패 {state['error_count']}회")
+            if state["last_run"]:
+                msg_lines.append(f"🔁 최근 실행: {state['last_run']} ({state['last_result']})")
+            else:
+                msg_lines.append("🔁 최근 실행: 아직 없음")
+            if state["last_error"]:
+                msg_lines.append(f"⚠️ 마지막 오류: {state['last_error']}")
+
+            msg_lines.append("────────")
+            msg_lines.append(f"🎫 대기 티켓: {pending}장")
+
+            if last_draw:
+                stamp = str(last_draw["draw_date"] or "")
+                msg_lines.append(
+                    f"🎯 최근 회차: {stamp[5:16]} · 당첨번호 {last_draw['winning_number']}"
+                    f" · {last_draw['ticket_count']}명"
+                )
+                # 이틀 넘게 회차 기록이 없으면 스레드가 멈춘 신호일 수 있습니다.
+                try:
+                    last_dt = KST.localize(datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
+                    idle_days = (now - last_dt).days
+                    if idle_days >= 2:
+                        msg_lines.append(f"🚨 {idle_days}일간 추첨 기록이 없습니다. 봇 재시작을 권합니다.")
+                except Exception:
+                    pass
+            else:
+                msg_lines.append("🎯 최근 회차: 기록 없음")
+
+            msg_lines.append("────────")
+            msg_lines.append("💡 상세 내역은 /복권로그")
 
             chat.reply("\n".join(msg_lines))
             return True
