@@ -19,7 +19,7 @@ import sys, threading, random
 from bots.party import handle_party_command
 from bots.event import handle_event_command
 from bots.user_system import handle_user_commands,start_lotto_scheduler
-from bots.game import handle_game_input,handle_369_command,handle_reaction_command,handle_game_cancel
+from bots.game import handle_game_input,handle_369_command,handle_reaction_command,handle_game_cancel,handle_chosung_command
 iris_url = sys.argv[1]
 bot = Bot(iris_url)
 
@@ -237,6 +237,9 @@ def on_message(chat: ChatContext):
 
             case "/369시작" | "/369끝" | "/369상태":
                 handle_369_command(chat)
+
+            case "/자음시작" | "/자음문제" | "/자음힌트" | "/자음패스" | "/자음끝":
+                handle_chosung_command(chat)
             case "/게임삭제" | "/게임취소":
                 handle_game_cancel(chat)
             case _:

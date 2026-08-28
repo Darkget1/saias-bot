@@ -18,6 +18,13 @@ ENABLE_GAME_REWARD = False
 GAME_STATE: Dict[int, Dict[str, Any]] = {}
 GAME_LOCK = threading.RLock()
 
+# 게임 코드 -> 화면에 보일 이름. 여러 곳에서 쓰므로 모듈 상수로 둡니다.
+GAME_NAMES_KR = {
+    "REACTION": "반응 속도",
+    "369": "369",
+    "CHOSUNG": "자음 퀴즈",
+}
+
 
 def _reaction_timeout(chat: ChatContext, room_id: int, expected_idx: int):
     """5초 동안 응답이 없을 경우 패배 처리하고 다음 턴으로 넘기는 함수"""
@@ -274,12 +281,11 @@ def handle_game_cancel(chat: ChatContext):
             chat.reply("❌ 게임을 시작한 사람만 삭제(취소)할 수 있습니다.")
             return True
 
-        game_names_kr = {
-            "REACTION": "반응 속도",
-            "369": "369"
-        }
         raw_game_name = state["current_game"]
-        display_name = game_names_kr.get(raw_game_name, raw_game_name)
+        display_name = GAME_NAMES_KR.get(raw_game_name, raw_game_name)
+
+        if raw_game_name == "CHOSUNG":
+            _chosung_cancel_timer(state["data"])
 
         # 상태 초기화
         state["current_game"] = None
@@ -328,7 +334,31 @@ def handle_game_input(chat: ChatContext):
                     chat.reply(f"❌ 지금은 {data['members'][data['current_idx']]['name']}님의 차례입니다!")
             return  # 반응게임 중일 땐 여기서 종료
 
-        # 2. 369 게임 처리
+        # 2. 자음 퀴즈 처리
+        elif state["current_game"] == "CHOSUNG":
+            data = state["data"]
+            if not data.get("answer"):
+                return
+
+            # 오답에는 반응하지 않습니다. 일반 대화가 전부 오답 처리되면 방이 시끄러워집니다.
+            if _normalize_answer(text) != _normalize_answer(data["answer"]):
+                return
+
+            uid = str(chat.sender.id)
+            name = _get_user_name(chat.sender)
+            score = data["scores"].setdefault(uid, {"id": chat.sender.id, "name": name, "count": 0})
+            score["name"] = name
+            score["count"] += 1
+            _chosung_cancel_timer(data)
+            data["miss_streak"] = 0
+
+            _chosung_next_question(
+                chat, state,
+                prefix=f"정답! [{data['answer']}]\n{name}님 {score['count']}개째",
+            )
+            return
+
+        # 3. 369 게임 처리
         elif state["current_game"] == "369":
             data = state["data"]
             expect_n = data["current"] + 1
@@ -349,3 +379,273 @@ def handle_game_input(chat: ChatContext):
                 if text.isdigit() or "ㅉ" in text:
                     chat.reply(f"❌ 틀렸어! {expect_n} 차례였고 정답은 '{ans}'")
                     state["current_game"] = None
+
+# ─────────────────────────────
+# [3] 자음(초성) 퀴즈 로직
+# ─────────────────────────────
+CHOSUNG_TABLE = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+CHOSUNG_HANGUL_START = 0xAC00
+CHOSUNG_HANGUL_END = 0xD7A3
+CHOSUNG_REWARD_POINT = 10
+CHOSUNG_TIME_LIMIT = 60.0        # 문제당 제한시간(초)
+CHOSUNG_MAX_MISS_STREAK = 2      # 연속 시간초과 허용 횟수. 넘으면 자동 종료
+
+# 카테고리를 함께 알려줘야 초성만으로 좁혀지지 않는 문제를 풀 수 있습니다.
+CHOSUNG_WORDS: Dict[str, list] = {
+    "음식": [
+        "김치찌개", "된장찌개", "삼겹살", "떡볶이", "짜장면", "탕수육", "비빔밥",
+        "순대국밥", "제육볶음", "돈가스", "칼국수", "물냉면", "감자탕", "닭갈비",
+        "부대찌개", "양념치킨", "순두부찌개",
+    ],
+    "동물": [
+        "코끼리", "기린", "호랑이", "다람쥐", "고슴도치", "펭귄", "카멜레온",
+        "너구리", "청설모", "독수리", "두더지", "하이에나", "코뿔소", "원숭이",
+        "미어캣", "판다",
+    ],
+    "사물": [
+        "냉장고", "세탁기", "청소기", "선풍기", "에어컨", "전자레인지", "가습기",
+        "충전기", "이어폰", "키보드", "책가방", "우산", "손톱깎이", "돋보기",
+        "빨래건조대",
+    ],
+    "장소": [
+        "도서관", "놀이공원", "지하철역", "박물관", "수영장", "영화관", "편의점",
+        "우체국", "찜질방", "주차장", "미용실", "체육관", "공항", "전망대",
+    ],
+    "길드": [
+        "칸쵸조밥", "칸쵸메롱", "칸쵸양아치",
+    ],
+    "마비노기": [
+        "던바튼", "티르코네일", "심층구멍", "교역품", "엠블럼", "방어구", "물레방아",
+        "룬각인", "밤의흔적", "창백한산", "여신강림", "행운의여신",
+    ],
+}
+
+
+def _to_chosung(word: str) -> str:
+    """한글 문자열에서 초성만 뽑아냅니다. 한글이 아닌 글자는 그대로 둡니다."""
+    out = []
+    for ch in word:
+        code = ord(ch)
+        if CHOSUNG_HANGUL_START <= code <= CHOSUNG_HANGUL_END:
+            out.append(CHOSUNG_TABLE[(code - CHOSUNG_HANGUL_START) // 588])
+        elif ch.strip():
+            out.append(ch)
+    return "".join(out)
+
+
+def _normalize_answer(text: str) -> str:
+    """띄어쓰기 차이로 오답 처리되지 않도록 공백을 모두 지우고 비교합니다."""
+    return "".join(str(text or "").split())
+
+
+def _chosung_pick_word(asked: list):
+    """아직 안 나온 단어 중에서 하나 고릅니다. 다 소진되면 None."""
+    pool = [
+        (category, word)
+        for category, words in CHOSUNG_WORDS.items()
+        for word in words
+        if word not in asked
+    ]
+    if not pool:
+        return None
+    return random.choice(pool)
+
+
+def _chosung_cancel_timer(data: Dict[str, Any]):
+    """걸려 있는 제한시간 타이머를 해제합니다. 없으면 아무 일도 하지 않습니다."""
+    timer = data.get("timer")
+    if timer is not None:
+        try:
+            timer.cancel()
+        except Exception:
+            pass
+        data["timer"] = None
+
+
+def _chosung_timeout(chat: ChatContext, room_id: int, expected_no: int):
+    """제한시간 안에 아무도 못 맞히면 정답을 공개하고 다음 문제로 넘깁니다."""
+    state = _get_game_state(room_id)
+    with GAME_LOCK:
+        # 그 사이 게임이 끝났거나 다음 문제로 넘어갔으면 흘러간 타이머입니다.
+        if state["current_game"] != "CHOSUNG":
+            return
+        data = state["data"]
+        if data.get("question_no") != expected_no:
+            return
+
+        data["timer"] = None
+        data["miss_streak"] = data.get("miss_streak", 0) + 1
+
+        # 아무도 안 보고 있는 방에서 74문제를 혼자 풀어대지 않도록 멈춥니다.
+        if data["miss_streak"] >= CHOSUNG_MAX_MISS_STREAK:
+            chat.reply(
+                f"⏰ 시간 초과! 정답은 [{data['answer']}] 였습니다.\n"
+                f"{CHOSUNG_MAX_MISS_STREAK}문제 연속으로 정답이 없어 게임을 종료합니다."
+            )
+            _finish_chosung(chat, state)
+            return
+
+        _chosung_next_question(
+            chat, state,
+            prefix=f"⏰ 시간 초과! 정답은 [{data['answer']}] 였습니다.",
+        )
+
+
+def _chosung_next_question(chat: ChatContext, state: Dict[str, Any], prefix: str = ""):
+    """다음 문제를 내고 상태를 갱신합니다. 낼 문제가 없으면 게임을 마칩니다."""
+    data = state["data"]
+    _chosung_cancel_timer(data)
+    picked = _chosung_pick_word(data["asked"])
+
+    if picked is None:
+        chat.reply((prefix + "\n" if prefix else "") + "📚 준비된 문제를 모두 풀었습니다!")
+        _finish_chosung(chat, state)
+        return
+
+    category, word = picked
+    data["asked"].append(word)
+    data["answer"] = word
+    data["category"] = category
+    data["chosung"] = _to_chosung(word)
+    data["hint_used"] = False
+    data["question_no"] += 1
+
+    lines = []
+    if prefix:
+        lines.append(prefix)
+        lines.append("")
+    lines.append(f"🔤 [{data['question_no']}번 문제]")
+    lines.append("────────")
+    lines.append(f"📂 분류 : {category}")
+    lines.append(f"❓ 초성 : {data['chosung']}")
+    lines.append(f"📏 글자 : {len(word)}글자")
+    lines.append("────────")
+    lines.append("💡 채팅으로 바로 정답을 입력하세요")
+    lines.append(f"⏱️ 제한시간 {int(CHOSUNG_TIME_LIMIT)}초")
+    lines.append("힌트 /자음힌트 · 넘기기 /자음패스 · 종료 /자음끝")
+    chat.reply("\n".join(lines))
+
+    # 아무도 못 맞히면 방이 이 게임에 묶여버리므로 제한시간을 겁니다.
+    timer = threading.Timer(
+        CHOSUNG_TIME_LIMIT, _chosung_timeout,
+        args=[chat, chat.room.id, data["question_no"]],
+    )
+    timer.daemon = True
+    data["timer"] = timer
+    timer.start()
+
+
+def _finish_chosung(chat: ChatContext, state: Dict[str, Any]):
+    """점수를 집계해 결과를 알리고 게임을 종료합니다."""
+    data = state["data"]
+    _chosung_cancel_timer(data)
+    scores = sorted(data["scores"].values(), key=lambda s: -s["count"])
+
+    lines = ["🏁 [ 자음 퀴즈 종료 ]", "────────"]
+    if scores:
+        medals = ["🥇", "🥈", "🥉"]
+        for i, s in enumerate(scores):
+            mark = medals[i] if i < len(medals) else "▪️"
+            lines.append(f"{mark} {s['name']} - {s['count']}개")
+    else:
+        lines.append("맞힌 사람이 없습니다.")
+    lines.append("────────")
+    lines.append(f"총 {data['question_no']}문제 출제")
+
+    if scores:
+        winner = scores[0]
+        if ENABLE_GAME_REWARD:
+            try:
+                with DB_LOCK:
+                    conn = get_db_conn()
+                    cur = conn.cursor()
+                    cur.execute("UPDATE users SET points = points + ? WHERE user_id = ?",
+                                (CHOSUNG_REWARD_POINT, winner["id"]))
+                    conn.commit()
+                    conn.close()
+                lines.append("")
+                lines.append(f"🎉 {winner['name']}님 1등! {CHOSUNG_REWARD_POINT}포인트가 지급되었습니다. (🅟+{CHOSUNG_REWARD_POINT})")
+            except Exception as e:
+                print(f"포인트 지급 오류: {e}")
+                lines.append("")
+                lines.append("⚠️ 포인트 지급 중 오류가 발생했습니다.")
+        else:
+            lines.append("")
+            lines.append("💡 (현재는 테스트 기간이라 포인트가 지급되지 않습니다.)")
+
+    chat.reply("\n".join(lines))
+    state["current_game"] = None
+    state["data"] = {}
+
+
+def handle_chosung_command(chat: ChatContext):
+    room_id = chat.room.id
+    state = _get_game_state(room_id)
+    cmd = getattr(chat.message, "command", "")
+
+    with GAME_LOCK:
+        if cmd == "/자음시작":
+            if state["current_game"] and state["current_game"] != "CHOSUNG":
+                display_name = GAME_NAMES_KR.get(state["current_game"], state["current_game"])
+                chat.reply(f"⚠️ 이미 [{display_name}] 게임이 진행/모집 중입니다.")
+                return True
+
+            if state["current_game"] == "CHOSUNG":
+                chat.reply("⚠️ 이미 자음 퀴즈가 진행 중입니다.\n현재 문제는 /자음문제 로 다시 볼 수 있습니다.")
+                return True
+
+            state["current_game"] = "CHOSUNG"
+            state["data"] = {
+                "creator_id": str(chat.sender.id),
+                "answer": "",
+                "category": "",
+                "chosung": "",
+                "hint_used": False,
+                "asked": [],
+                "scores": {},
+                "question_no": 0,
+                "timer": None,
+                "miss_streak": 0,
+            }
+            _chosung_next_question(chat, state, prefix="🔠 자음 퀴즈 시작!")
+            return True
+
+        if state["current_game"] != "CHOSUNG":
+            chat.reply("⚠️ 진행 중인 자음 퀴즈가 없습니다.\n/자음시작 으로 시작하세요.")
+            return True
+
+        data = state["data"]
+
+        if cmd == "/자음문제":
+            chat.reply(
+                f"🔤 [{data['question_no']}번 문제]\n"
+                f"────────\n"
+                f"📂 분류 : {data['category']}\n"
+                f"❓ 초성 : {data['chosung']}\n"
+                f"📏 글자 : {len(data['answer'])}글자"
+            )
+            return True
+
+        if cmd == "/자음힌트":
+            if data["hint_used"]:
+                chat.reply(f"💬 힌트는 문제당 한 번입니다.\n첫 글자 : {data['answer'][0]}")
+                return True
+
+            data["hint_used"] = True
+            chat.reply(
+                f"💬 힌트!\n"
+                f"첫 글자 : {data['answer'][0]}\n"
+                f"❓ 초성 : {data['chosung']} ({len(data['answer'])}글자)"
+            )
+            return True
+
+        if cmd == "/자음패스":
+            data["miss_streak"] = 0
+            _chosung_next_question(chat, state, prefix=f"⏭️ 정답은 [{data['answer']}] 였습니다.")
+            return True
+
+        if cmd == "/자음끝":
+            _finish_chosung(chat, state)
+            return True
+
+    return False
