@@ -399,6 +399,8 @@ def remove_admin(admin_id):
 
 TAGGED_USER_SQL_CONDITION = "name LIKE '%[%' AND name LIKE '%]%'"
 
+CHECKIN_REWARD_POINT = 10        # 출석체크 1회 적립 포인트
+LOTTO_DRAW_HOUR = 6              # 복권 추첨 시각(시). 스케줄러와 안내 문구가 함께 씁니다.
 LOTTO_MIN_NUMBER = 111
 LOTTO_MAX_NUMBER = 222
 LOTTO_FIRST_PRIZE = 300
@@ -410,6 +412,21 @@ USE_LEGACY_PROBABILITY_LOTTO_DRAW = False
 # 범위를 손대지 않는 이유: 유저가 받는 번호의 생김새가 바뀌지 않아야 하기 때문입니다.
 # None 을 넣으면 조작 없이 균등 추첨(2등 약 13.9%)으로 돌아갑니다.
 LOTTO_TARGET_SECOND_RATE = 0.05
+
+
+def _lotto_info_lines():
+    """
+    복권 안내 문구.
+
+    상금과 추첨 시각을 상수에서 그대로 읽으므로,
+    설정을 바꾸면 유저에게 나가는 안내도 같이 바뀝니다.
+    """
+    return [
+        "────────",
+        f"⏰ 매일 오전 {LOTTO_DRAW_HOUR}시 추첨",
+        f"🥇 1등 🅟{LOTTO_FIRST_PRIZE:,}  ·  🥈 2등 🅟{LOTTO_SECOND_PRIZE:,}",
+        "💡 모은 포인트는 /상점 에서 사용할 수 있어요",
+    ]
 
 
 def _format_lotto_number(number):
@@ -923,7 +940,7 @@ def start_lotto_scheduler(bot):
                 # target = now + timedelta(minutes=1)
 
                 # [운영용] 매일 오전 6시
-                target = now.replace(hour=6, minute=0, second=0, microsecond=0)
+                target = now.replace(hour=LOTTO_DRAW_HOUR, minute=0, second=0, microsecond=0)
                 if now >= target:
                     target += timedelta(days=1)
 
@@ -1396,11 +1413,14 @@ def handle_user_commands(chat: ChatContext):
             today_str = datetime.now(KST).date().isoformat()
 
             if user['last_checkin_date'] == today_str:
-                chat.reply(
-                    f"⚠️ 이미 출석했습니다.\n"
-                    f"📅 총 출석: {user['total_checkin']}일\n"
-                    f"🔥 연속 출석: {user['consecutive_checkin']}일"
-                )
+                chat.reply("\n".join([
+                    "⚠️ 이미 출석했습니다.",
+                    f"📅 총 출석: {user['total_checkin']}일",
+                    f"🔥 연속 출석: {user['consecutive_checkin']}일",
+                    "────────",
+                    f"💡 출석은 하루 한 번, 🅟{CHECKIN_REWARD_POINT} 적립됩니다",
+                    "🏪 모은 포인트는 /상점 에서 사용할 수 있어요",
+                ]))
                 return True
 
             now = datetime.now(KST)
@@ -1422,18 +1442,22 @@ def handle_user_commands(chat: ChatContext):
                     SET total_checkin = ?, 
                         consecutive_checkin = ?, 
                         last_checkin_date = ?, 
-                        points = points + 10 
+                        points = points + ?
                     WHERE user_id = ?
                     """,
-                    (new_total, new_consecutive, today_str, user['user_id']))
+                    (new_total, new_consecutive, today_str, CHECKIN_REWARD_POINT, user['user_id']))
                 conn.commit()
                 conn.close()
 
-            chat.reply(
-                f"✅ 출석 완료! (🅟10)\n"
-                f"📅 총 출석: {new_total}일\n"
-                f"🔥 연속 출석: {new_consecutive}일째"
-            )
+            chat.reply("\n".join([
+                f"✅ 출석 완료! (🅟{CHECKIN_REWARD_POINT})",
+                f"📅 총 출석: {new_total}일",
+                f"🔥 연속 출석: {new_consecutive}일째",
+                "────────",
+                f"💡 매일 ㅊㅊ 으로 🅟{CHECKIN_REWARD_POINT} 적립",
+                "🎲 /복권자동 으로 무료 복권도 받아가세요",
+                "🏪 모은 포인트는 /상점 에서 사용할 수 있어요",
+            ]))
             return True
 
         if cmd == "/내정보":
@@ -1536,14 +1560,21 @@ def handle_user_commands(chat: ChatContext):
                 row = cur.fetchone()
 
                 if row:
-                    chat.reply(f"🎫 이미 추첨 대기 중인 복권이 있습니다.\n번호: [{row['numbers']}]\n(매일 오전 6시 당첨 결과를 공개!)")
+                    chat.reply("\n".join(
+                        ["🎫 이미 추첨 대기 중인 복권이 있습니다.",
+                         f"번호: [{row['numbers']}]"]
+                        + _lotto_info_lines()
+                    ))
                 else:
                     new_nums = _generate_lotto_number()
                     cur.execute(
                         "INSERT INTO lotto (user_id, lotto_date, numbers, room_id, is_drawn) VALUES (?, ?, ?, ?, 0)",
                         (user['user_id'], today, new_nums, room_id))
                     conn.commit()
-                    chat.reply(f"🎲 복권 발행 완료: [{new_nums}]\n(행운을 빕니다!)")
+                    chat.reply("\n".join(
+                        [f"🎲 복권 발행 완료: [{new_nums}]", "(행운을 빕니다!)"]
+                        + _lotto_info_lines()
+                    ))
                 conn.close()
             return True
 
@@ -1555,13 +1586,18 @@ def handle_user_commands(chat: ChatContext):
                 wait_cnt = cur.fetchone()['cnt']
                 conn.close()
 
-            chat.reply(
-                f"**복권 시스템 정보**\n\n"
-                f"번호 범위: {LOTTO_MIN_NUMBER}~{LOTTO_MAX_NUMBER}\n"
-                f"1등 상금: {LOTTO_FIRST_PRIZE}P\n"
-                f"2등 상금: {LOTTO_SECOND_PRIZE}P\n\n"
-                f"현재 {wait_cnt}명이 참여 중입니다."
-            )
+            chat.reply("\n".join(
+                [
+                    "🎰 복권 시스템 정보",
+                    "",
+                    f"번호 범위: {LOTTO_MIN_NUMBER}~{LOTTO_MAX_NUMBER}",
+                    f"현재 {wait_cnt}명이 참여 중입니다.",
+                    "",
+                    "발행은 무료이며 1인 1매입니다.",
+                    "💡 /복권자동 으로 복권을 받으세요",
+                ]
+                + _lotto_info_lines()
+            ))
             return True
 
         # ─────────────────────────────
