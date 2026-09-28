@@ -12,6 +12,7 @@ from urllib import request as urlrequest
 ABYSS_HOLE_API_URL = "https://mabimobi.life/d/api/v1/eab"
 ABYSS_HOLE_CHECK_INTERVAL_SECONDS = 30 * 60
 ABYSS_HOLE_PRE_ALERT_SECONDS = 10 * 60
+ABYSS_HOLE_HOUR_ALERT_SECONDS = 60 * 60
 ABYSS_HOLE_TIME_SYNC_THRESHOLD_SECONDS = 60
 ABYSS_HOLE_REQUEST_TIMEOUT_SECONDS = 10
 ABYSS_HOLE_TRACKER_ENABLED = os.getenv("ABYSS_HOLE_TRACKER_ENABLED", "1").strip() != "0"
@@ -413,6 +414,10 @@ def format_abyss_hole_status(status):
 
 def _format_abyss_hole_alert_message(status, alert_type):
     start = status.get("start_datetime")
+    if alert_type == "hour":
+        return ("어비스 구멍 출현 1시간 전 안내입니다. "
+                f"출현 예정: {_format_datetime(start)} · "
+                f"남은 시간: {_format_seconds(status.get('seconds_to_start'))}")
     if alert_type == "pre":
         return f"어비스 구멍 출현 10분 전입니다. 출현 예정: {_format_datetime(start)}"
 
@@ -424,7 +429,8 @@ def _format_abyss_hole_alert_message(status, alert_type):
     return message
 
 
-def _next_wait_seconds(status, pre_alert_sent=False, spawn_alert_sent=False):
+def _next_wait_seconds(status, pre_alert_sent=False, spawn_alert_sent=False,
+                       hour_alert_sent=False):
     wait_seconds = ABYSS_HOLE_CHECK_INTERVAL_SECONDS
     seconds_to_start = status.get("seconds_to_start")
     target_remaining_seconds = status.get("target_remaining_seconds")
@@ -436,6 +442,11 @@ def _next_wait_seconds(status, pre_alert_sent=False, spawn_alert_sent=False):
 
     if seconds_to_start is None:
         return wait_seconds
+
+    if not hour_alert_sent and seconds_to_start > ABYSS_HOLE_HOUR_ALERT_SECONDS:
+        wait_seconds = min(
+            wait_seconds, max(5, seconds_to_start - ABYSS_HOLE_HOUR_ALERT_SECONDS + 1)
+        )
 
     if not pre_alert_sent and seconds_to_start > ABYSS_HOLE_PRE_ALERT_SECONDS:
         return min(wait_seconds, max(5, seconds_to_start - ABYSS_HOLE_PRE_ALERT_SECONDS + 1))
@@ -459,7 +470,8 @@ def start_abyss_hole_tracker(bot, send_message, get_db_conn, db_lock, kst):
             return
         _TRACKER_STARTED = True
 
-    state = {"event_key": None, "pre_alert_sent": False, "spawn_alert_sent": False}
+    state = {"event_key": None, "pre_alert_sent": False, "spawn_alert_sent": False,
+             "hour_alert_sent": False}
 
     def send_to_rooms(status, alert_type, room_ids):
         if not room_ids:
@@ -486,6 +498,7 @@ def start_abyss_hole_tracker(bot, send_message, get_db_conn, db_lock, kst):
 
                 if event_key and event_key != state["event_key"]:
                     state["event_key"] = event_key
+                    state["hour_alert_sent"] = False
                     state["pre_alert_sent"] = False
                     state["spawn_alert_sent"] = False
 
@@ -494,6 +507,18 @@ def start_abyss_hole_tracker(bot, send_message, get_db_conn, db_lock, kst):
                     f"remaining={target_remaining_seconds} time_offset={time_offset_seconds} "
                     f"sync={time_sync_applied} rooms={len(room_ids)}"
                 )
+
+                # A late start within ten minutes should only send the imminent
+                # warning, not both advance notices at once.
+                if (
+                    is_open is not True
+                    and seconds_to_start is not None
+                    and ABYSS_HOLE_PRE_ALERT_SECONDS < seconds_to_start <= ABYSS_HOLE_HOUR_ALERT_SECONDS
+                    and not state["hour_alert_sent"]
+                    and room_ids
+                ):
+                    send_to_rooms(status, "hour", room_ids)
+                    state["hour_alert_sent"] = True
 
                 if (
                     is_open is not True
@@ -512,6 +537,7 @@ def start_abyss_hole_tracker(bot, send_message, get_db_conn, db_lock, kst):
                     status,
                     state["pre_alert_sent"],
                     state["spawn_alert_sent"],
+                    state["hour_alert_sent"],
                 )
                 if wait_seconds != ABYSS_HOLE_CHECK_INTERVAL_SECONDS:
                     print(f"[어구알림] 다음 체크 보정: {wait_seconds:.1f}초")
